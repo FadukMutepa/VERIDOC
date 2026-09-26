@@ -1,0 +1,6 @@
+{
+  "name": "VeriDoc - Plataforma de Verificação de Autenticidade",
+  "description": "Especificação arquitetural, fluxo de emissão/validação com QR Code e planeamento MVP do VeriDoc.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
