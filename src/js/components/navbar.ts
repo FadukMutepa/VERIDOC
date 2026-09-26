@@ -5,7 +5,6 @@ import { authService } from '../services/auth';
  * Integrada com sessão ativa, perfis de Administrador e Instituição
  */
 export function renderNavbar(currentPath: string): string {
-  const isDashboard = currentPath.includes('/instituicao/dashboard');
   const user = authService.getUser();
 
   return `
@@ -35,18 +34,29 @@ export function renderNavbar(currentPath: string): string {
                 <i class="bi bi-patch-check me-1"></i> Verificar Documento
               </a>
             </li>
-            <li class="nav-item">
-              <a class="nav-link vd-nav-link ${currentPath === '/instituicao/cadastro' ? 'active' : ''}" href="/instituicao/cadastro" data-route="/instituicao/cadastro">
-                Para Instituições
-              </a>
-            </li>
             ${user ? `
               <li class="nav-item">
                 <a class="nav-link vd-nav-link ${currentPath === '/instituicao/dashboard' ? 'active' : ''}" href="/instituicao/dashboard" data-route="/instituicao/dashboard">
                   <i class="bi bi-speedometer2 me-1"></i> Dashboard
                 </a>
               </li>
-            ` : ''}
+              <li class="nav-item">
+                <a class="nav-link vd-nav-link ${currentPath === '/instituicao/documentos' ? 'active' : ''}" href="/instituicao/documentos" data-route="/instituicao/documentos">
+                  <i class="bi bi-file-earmark-text me-1"></i> Documentos
+                </a>
+              </li>
+              <li class="nav-item">
+                <a class="nav-link vd-nav-link text-warning ${currentPath === '/instituicao/documentos/novo' ? 'active text-white' : ''}" href="/instituicao/documentos/novo" data-route="/instituicao/documentos/novo">
+                  <i class="bi bi-plus-circle me-1"></i> Emitir
+                </a>
+              </li>
+            ` : `
+              <li class="nav-item">
+                <a class="nav-link vd-nav-link ${currentPath === '/instituicao/cadastro' ? 'active' : ''}" href="/instituicao/cadastro" data-route="/instituicao/cadastro">
+                  Para Instituições
+                </a>
+              </li>
+            `}
           </ul>
 
           <div class="d-flex align-items-center gap-2 mt-3 mt-lg-0">
@@ -66,9 +76,20 @@ export function renderNavbar(currentPath: string): string {
                   <li><hr class="dropdown-divider border-secondary"></li>
                   <li>
                     <a class="dropdown-item text-white small rounded-2" href="/instituicao/dashboard" data-route="/instituicao/dashboard">
-                      <i class="bi bi-grid-1x2 me-2"></i> Painel Geral
+                      <i class="bi bi-speedometer2 me-2"></i> Dashboard Geral
                     </a>
                   </li>
+                  <li>
+                    <a class="dropdown-item text-white small rounded-2" href="/instituicao/documentos" data-route="/instituicao/documentos">
+                      <i class="bi bi-file-earmark-text me-2"></i> Ver Documentos
+                    </a>
+                  </li>
+                  <li>
+                    <a class="dropdown-item text-white small rounded-2" href="/instituicao/documentos/novo" data-route="/instituicao/documentos/novo">
+                      <i class="bi bi-patch-plus me-2 text-warning"></i> Emitir Novo Documento
+                    </a>
+                  </li>
+                  <li><hr class="dropdown-divider border-secondary"></li>
                   <li>
                     <button class="dropdown-item text-danger small rounded-2" id="navBtnLogout">
                       <i class="bi bi-box-arrow-left me-2"></i> Encerrar Sessão

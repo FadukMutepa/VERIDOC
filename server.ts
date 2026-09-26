@@ -4,6 +4,7 @@ import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
+import QRCode from 'qrcode';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -636,6 +637,486 @@ app.post('/api/admin/institutions/:id/status', requireAuth, requireAdmin, verify
   } catch (err) {
     console.error('Erro ao atualizar status da instituição:', err);
     res.status(500).json({ error: 'Erro ao atualizar instituição.' });
+  }
+});
+
+// ============================================================================
+// GESTÃO REAL DE DOCUMENTOS (EMISSÃO, LISTAGEM, DETALHES, REVOGAÇÃO, VERIFICAÇÃO)
+// ============================================================================
+
+// Helper: Gerador de código único com verificação real de colisão no MySQL
+async function generateUniqueVerificationCode(conn: any): Promise<string> {
+  const year = new Date().getFullYear();
+  const charset = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let attempts = 0;
+
+  while (attempts < 100) {
+    attempts++;
+    let randomPart = '';
+    const bytes = crypto.randomBytes(8);
+    for (let i = 0; i < 8; i++) {
+      randomPart += charset[bytes[i] % charset.length];
+    }
+
+    const code = `VD-${year}-${randomPart}`;
+    const [rows]: any = await conn.query(
+      'SELECT id FROM documents WHERE verification_code = ? LIMIT 1',
+      [code]
+    );
+
+    if (rows.length === 0) {
+      return code;
+    }
+  }
+
+  throw new Error('Falha ao gerar código único após 100 tentativas.');
+}
+
+// 10. Emissão Real de Documento (Somente Instituição Aprovada / Utilizador Autorizado)
+app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  const institutionId = user.institutionId;
+
+  const {
+    holder_name,
+    document_type,
+    course,
+    area,
+    issue_date,
+    expiry_date,
+    description,
+    observations,
+  } = req.body;
+
+  // Validação no servidor (Regra: Não confiar no JavaScript do cliente)
+  if (!holder_name || !holder_name.trim()) {
+    return res.status(422).json({ error: 'O nome completo do titular é obrigatório.' });
+  }
+  if (!document_type || !document_type.trim()) {
+    return res.status(422).json({ error: 'O tipo de documento é obrigatório.' });
+  }
+  if (!course || !course.trim()) {
+    return res.status(422).json({ error: 'O curso / certificação é obrigatório.' });
+  }
+  if (!issue_date || !issue_date.trim()) {
+    return res.status(422).json({ error: 'A data de emissão é obrigatória.' });
+  }
+
+  // Validação de datas
+  const issueDateObj = new Date(issue_date);
+  if (isNaN(issueDateObj.getTime())) {
+    return res.status(422).json({ error: 'Data de emissão inválida.' });
+  }
+
+  if (expiry_date && expiry_date.trim()) {
+    const expiryDateObj = new Date(expiry_date);
+    if (isNaN(expiryDateObj.getTime())) {
+      return res.status(422).json({ error: 'Data de validade inválida.' });
+    }
+    if (expiryDateObj < issueDateObj) {
+      return res.status(422).json({ error: 'A data de validade não pode ser anterior à data de emissão.' });
+    }
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    // 1. Identificar e confirmar instituição
+    const [instRows]: any = await connection.query(
+      'SELECT id, name, status FROM institutions WHERE id = ? LIMIT 1',
+      [institutionId]
+    );
+
+    if (instRows.length === 0 || instRows[0].status !== 'approved') {
+      await connection.rollback();
+      return res.status(403).json({
+        error: 'Apenas instituições com status APROVADA podem emitir documentos oficiais.',
+      });
+    }
+
+    const institution = instRows[0];
+
+    // 2. Gerar código único com verificação rigorosa de colisão
+    const verificationCode = await generateUniqueVerificationCode(connection);
+
+    // 3. Criar hash criptográfico SHA-256 no servidor
+    const hashData = [
+      institution.id,
+      holder_name.trim(),
+      document_type.trim(),
+      course.trim(),
+      issue_date.trim(),
+      verificationCode,
+      'veridoc_salt_secure_2026',
+    ].join('|');
+
+    const documentHash = crypto.createHash('sha256').update(hashData).digest('hex');
+
+    // 4. Criar QR Code no servidor que aponta estritamente para a URL de verificação pública
+    const host = req.get('host') || 'localhost:3000';
+    const protocol = req.protocol || 'http';
+    const verificationUrl = `${protocol}://${host}/verificar/${verificationCode}`;
+
+    const qrCodeDataUrl = await QRCode.toDataURL(verificationUrl, {
+      errorCorrectionLevel: 'H',
+      margin: 1,
+      width: 320,
+      color: {
+        dark: '#0A1428',
+        light: '#FFFFFF',
+      },
+    });
+
+    // 5. Registrar o documento no MySQL com status VALID
+    const [docResult]: any = await connection.query(
+      `INSERT INTO documents 
+        (institution_id, holder_name, document_type, course, area, issue_date, expiry_date, description, observations, verification_code, hash, qr_code, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', NOW(), NOW())`,
+      [
+        institution.id,
+        holder_name.trim(),
+        document_type.trim(),
+        course.trim(),
+        area ? area.trim() : null,
+        issue_date.trim(),
+        expiry_date && expiry_date.trim() ? expiry_date.trim() : null,
+        description ? description.trim() : null,
+        observations ? observations.trim() : null,
+        verificationCode,
+        documentHash,
+        qrCodeDataUrl,
+      ]
+    );
+
+    const documentId = docResult.insertId;
+
+    // 6. Registrar a operação no histórico do documento (document_history)
+    await connection.query(
+      `INSERT INTO document_history (document_id, user_id, action, description, created_at, updated_at)
+       VALUES (?, ?, 'created', ?, NOW(), NOW())`,
+      [
+        documentId,
+        user.id,
+        `Documento emitido oficialmente por ${user.name} (${institution.name}).`,
+      ]
+    );
+
+    // 7. Registrar no log de auditoria global (audit_logs)
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
+       VALUES (?, 'document_issued', ?, ?, NOW(), NOW())`,
+      [
+        user.id,
+        req.ip || '127.0.0.1',
+        `Documento ID ${documentId} emitido com código '${verificationCode}' para o titular '${holder_name.trim()}'.`,
+      ]
+    );
+
+    await connection.commit();
+
+    return res.status(201).json({
+      success: true,
+      message: 'Documento emitido com sucesso com código único e selo QR Code!',
+      document: {
+        id: documentId,
+        verification_code: verificationCode,
+        holder_name: holder_name.trim(),
+        document_type: document_type.trim(),
+        course: course.trim(),
+        area: area ? area.trim() : null,
+        issue_date,
+        expiry_date: expiry_date || null,
+        status: 'valid',
+        hash: documentHash,
+        qr_code: qrCodeDataUrl,
+        verification_url: verificationUrl,
+      },
+    });
+  } catch (error: any) {
+    await connection.rollback();
+    console.error('Erro na emissão do documento:', error);
+    return res.status(500).json({ error: 'Erro ao emitir documento no servidor.' });
+  } finally {
+    connection.release();
+  }
+});
+
+// 11. Listagem de Documentos da Instituição (/instituicao/documentos)
+app.get('/api/documents', requireAuth, requireApprovedInstitution, async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  const institutionId = user.institutionId;
+
+  const targetInstId = (user.role === 'admin' && req.query.institution_id) ? req.query.institution_id : institutionId;
+  const { status, search } = req.query;
+
+  try {
+    let sql = `
+      SELECT d.id, d.institution_id, d.holder_name, d.document_type, d.course, d.area, 
+             d.issue_date, d.expiry_date, d.description, d.observations,
+             d.verification_code, d.hash, d.qr_code, d.status, d.created_at,
+             i.name AS institution_name,
+             (SELECT COUNT(*) FROM verifications v WHERE v.document_id = d.id) AS verification_count
+      FROM documents d
+      INNER JOIN institutions i ON d.institution_id = i.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    // Isolamento multi-tenant
+    if (user.role !== 'admin' || targetInstId) {
+      sql += ' AND d.institution_id = ?';
+      params.push(targetInstId);
+    }
+
+    if (status && ['valid', 'revoked', 'expired'].includes(status as string)) {
+      sql += ' AND d.status = ?';
+      params.push(status);
+    }
+
+    if (search && (search as string).trim()) {
+      const term = `%${(search as string).trim()}%`;
+      sql += ' AND (d.holder_name LIKE ? OR d.verification_code LIKE ? OR d.course LIKE ? OR d.document_type LIKE ?)';
+      params.push(term, term, term, term);
+    }
+
+    sql += ' ORDER BY d.id DESC LIMIT 100';
+
+    const [documents]: any = await pool.query(sql, params);
+
+    return res.json({
+      success: true,
+      documents,
+    });
+  } catch (err: any) {
+    console.error('Erro ao listar documentos:', err);
+    return res.status(500).json({ error: 'Erro ao buscar documentos.' });
+  }
+});
+
+// 12. Visualizar Documento por ID (com Histórico e Detalhes)
+app.get('/api/documents/:id', requireAuth, requireApprovedInstitution, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT d.*, i.name AS institution_name, i.email AS institution_email, i.city AS institution_city, i.country AS institution_country
+       FROM documents d
+       INNER JOIN institutions i ON d.institution_id = i.id
+       WHERE d.id = ? LIMIT 1`,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Documento não encontrado.' });
+    }
+
+    const doc = rows[0];
+
+    // Isolamento multi-tenant
+    if (user.role !== 'admin' && doc.institution_id !== user.institutionId) {
+      return res.status(403).json({ error: 'Acesso negado a documentos de outra instituição.' });
+    }
+
+    // Histórico do documento
+    const [history]: any = await pool.query(
+      `SELECT h.*, u.name AS user_name, u.email AS user_email
+       FROM document_history h
+       LEFT JOIN users u ON h.user_id = u.id
+       WHERE h.document_id = ?
+       ORDER BY h.id DESC`,
+      [id]
+    );
+
+    // Verificações
+    const [verifications]: any = await pool.query(
+      `SELECT id, result, ip_address, verified_at 
+       FROM verifications 
+       WHERE document_id = ? 
+       ORDER BY id DESC LIMIT 10`,
+      [id]
+    );
+
+    return res.json({
+      success: true,
+      document: doc,
+      history,
+      verifications,
+    });
+  } catch (err: any) {
+    console.error('Erro ao buscar detalhes do documento:', err);
+    return res.status(500).json({ error: 'Erro ao buscar detalhes do documento.' });
+  }
+});
+
+// 13. Revogar Documento com Justificativa
+app.post('/api/documents/:id/revoke', requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  const user = (req as any).user;
+
+  if (!reason || reason.trim().length < 5) {
+    return res.status(422).json({
+      error: 'A justificativa de revogação é obrigatória e deve conter pelo menos 5 caracteres.',
+    });
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [rows]: any = await connection.query(
+      'SELECT id, institution_id, verification_code, status, holder_name FROM documents WHERE id = ? LIMIT 1',
+      [id]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Documento não encontrado.' });
+    }
+
+    const doc = rows[0];
+
+    // Multi-tenant check
+    if (user.role !== 'admin' && doc.institution_id !== user.institutionId) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Acesso negado: Este documento pertence a outra instituição.' });
+    }
+
+    if (doc.status === 'revoked') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Este documento já se encontra revogado.' });
+    }
+
+    // 1. Atualizar status para 'revoked'
+    await connection.query(
+      "UPDATE documents SET status = 'revoked', updated_at = NOW() WHERE id = ?",
+      [id]
+    );
+
+    // 2. Registrar no histórico do documento
+    await connection.query(
+      `INSERT INTO document_history (document_id, user_id, action, description, created_at, updated_at)
+       VALUES (?, ?, 'revoked', ?, NOW(), NOW())`,
+      [
+        id,
+        user.id,
+        `Documento revogado por ${user.name}. Motivo legal: ${reason.trim()}`,
+      ]
+    );
+
+    // 3. Registrar no log de auditoria
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
+       VALUES (?, 'document_revoked', ?, ?, NOW(), NOW())`,
+      [
+        user.id,
+        req.ip || '127.0.0.1',
+        `Documento ID ${id} (${doc.verification_code}) de '${doc.holder_name}' revogado. Motivo: ${reason.trim()}`,
+      ]
+    );
+
+    await connection.commit();
+
+    return res.json({
+      success: true,
+      message: `Documento ${doc.verification_code} revogado com sucesso.`,
+    });
+  } catch (err: any) {
+    await connection.rollback();
+    console.error('Erro ao revogar documento:', err);
+    return res.status(500).json({ error: 'Erro ao revogar documento.' });
+  } finally {
+    connection.release();
+  }
+});
+
+// 14. Consulta e Validação Pública de Autenticidade (Usada por /verificar e pelo QR Code)
+app.get('/api/public/verify/:code', async (req: Request, res: Response) => {
+  const rawCode = req.params.code.trim().toUpperCase();
+
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT d.id, d.holder_name, d.document_type, d.course, d.area, d.issue_date, d.expiry_date,
+              d.description, d.verification_code, d.hash, d.status, d.qr_code,
+              i.name AS institution_name, i.country AS institution_country, i.city AS institution_city,
+              i.status AS institution_status
+       FROM documents d
+       INNER JOIN institutions i ON d.institution_id = i.id
+       WHERE UPPER(d.verification_code) = ? LIMIT 1`,
+      [rawCode]
+    );
+
+    const ip = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
+    const userAgent = req.headers['user-agent'] || 'Desconhecido';
+
+    if (rows.length === 0) {
+      // Registra tentativa com 'not_found'
+      await pool.query(
+        `INSERT INTO verifications (document_id, verification_code, result, ip_address, user_agent, verified_at)
+         VALUES (NULL, ?, 'not_found', ?, ?, NOW())`,
+        [rawCode, ip, userAgent]
+      );
+
+      return res.status(404).json({
+        found: false,
+        result: 'not_found',
+        title: 'DOCUMENTO NÃO ENCONTRADO',
+        message: `O código '${rawCode}' não foi localizado no registro oficial do VeriDoc. Documento inexistente ou adulterado.`,
+      });
+    }
+
+    const doc = rows[0];
+    let calculatedResult: 'valid' | 'revoked' | 'expired' = doc.status;
+
+    // Se estiver 'valid' mas com data de validade vencida
+    if (doc.status === 'valid' && doc.expiry_date) {
+      const exp = new Date(doc.expiry_date);
+      const now = new Date();
+      if (exp < now) {
+        calculatedResult = 'expired';
+      }
+    }
+
+    // Registra a verificação na tabela 'verifications'
+    await pool.query(
+      `INSERT INTO verifications (document_id, verification_code, result, ip_address, user_agent, verified_at)
+       VALUES (?, ?, ?, ?, ?, NOW())`,
+      [doc.id, rawCode, calculatedResult, ip, userAgent]
+    );
+
+    const title = 
+      calculatedResult === 'valid' ? 'DOCUMENTO VÁLIDO' :
+      calculatedResult === 'revoked' ? 'DOCUMENTO REVOGADO' :
+      'DOCUMENTO EXPIRADO';
+
+    return res.json({
+      found: true,
+      result: calculatedResult,
+      title,
+      document: {
+        titular: doc.holder_name,
+        tipo: doc.document_type,
+        curso: doc.course,
+        instituicao: doc.institution_name,
+        data_emissao: doc.issue_date,
+        data_validade: doc.expiry_date,
+        estado: calculatedResult.toUpperCase(),
+        codigo: doc.verification_code,
+        hash: doc.hash,
+        qr_code: doc.qr_code,
+        area: doc.area,
+        descricao: doc.description,
+        cidade: doc.institution_city,
+        pais: doc.institution_country,
+      },
+    });
+  } catch (err) {
+    console.error('Erro na verificação pública:', err);
+    return res.status(500).json({ error: 'Erro ao verificar autenticidade do documento.' });
   }
 });
 

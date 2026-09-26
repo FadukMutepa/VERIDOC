@@ -37,6 +37,36 @@ export interface InstitutionItem {
   created_at: string;
 }
 
+export interface DocumentItem {
+  id: number;
+  institution_id: number;
+  holder_name: string;
+  document_type: string;
+  course: string;
+  area?: string;
+  issue_date: string;
+  expiry_date?: string;
+  description?: string;
+  observations?: string;
+  verification_code: string;
+  hash: string;
+  qr_code?: string;
+  status: 'valid' | 'revoked' | 'expired';
+  institution_name?: string;
+  verification_count?: number;
+  created_at: string;
+}
+
+export interface DocumentHistoryItem {
+  id: number;
+  document_id: number;
+  user_id: number;
+  action: string;
+  description: string;
+  created_at: string;
+  user_name?: string;
+}
+
 class AuthService {
   private currentUser: AuthUser | null = null;
   private csrfToken: string | null = null;
@@ -211,6 +241,99 @@ class AuthService {
       return { success: true, message: data.message };
     } catch (e) {
       return { success: false, error: 'Erro ao atualizar estado da instituição.' };
+    }
+  }
+
+  public async createDocument(formData: Record<string, any>): Promise<{ success: boolean; message?: string; document?: DocumentItem; error?: string }> {
+    try {
+      const res = await fetch('/api/documents', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-csrf-token': this.getCsrfToken(),
+        },
+        body: JSON.stringify(formData),
+        credentials: 'include',
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao emitir documento.' };
+      }
+
+      return { success: true, message: data.message, document: data.document };
+    } catch (e) {
+      return { success: false, error: 'Falha na comunicação com o servidor ao emitir documento.' };
+    }
+  }
+
+  public async getDocuments(params?: { status?: string; search?: string; institution_id?: number }): Promise<{ success: boolean; documents?: DocumentItem[]; error?: string }> {
+    try {
+      const query = new URLSearchParams();
+      if (params?.status) query.append('status', params.status);
+      if (params?.search) query.append('search', params.search);
+      if (params?.institution_id) query.append('institution_id', params.institution_id.toString());
+
+      const res = await fetch(`/api/documents?${query.toString()}`, { credentials: 'include' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao buscar documentos.' };
+      }
+
+      return { success: true, documents: data.documents };
+    } catch (e) {
+      return { success: false, error: 'Erro ao conectar ao servidor para listar documentos.' };
+    }
+  }
+
+  public async getDocument(id: number): Promise<{ success: boolean; document?: DocumentItem; history?: DocumentHistoryItem[]; verifications?: any[]; error?: string }> {
+    try {
+      const res = await fetch(`/api/documents/${id}`, { credentials: 'include' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao carregar detalhes do documento.' };
+      }
+
+      return { success: true, document: data.document, history: data.history, verifications: data.verifications };
+    } catch (e) {
+      return { success: false, error: 'Erro ao buscar dados do documento.' };
+    }
+  }
+
+  public async revokeDocument(id: number, reason: string): Promise<{ success: boolean; message?: string; error?: string }> {
+    try {
+      const res = await fetch(`/api/documents/${id}/revoke`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-csrf-token': this.getCsrfToken(),
+        },
+        body: JSON.stringify({ reason }),
+        credentials: 'include',
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao revogar documento.' };
+      }
+
+      return { success: true, message: data.message };
+    } catch (e) {
+      return { success: false, error: 'Erro ao solicitar revogação do documento.' };
+    }
+  }
+
+  public async verifyDocumentPublic(code: string): Promise<{ found: boolean; result?: string; document?: any; message?: string; error?: string }> {
+    try {
+      const res = await fetch(`/api/public/verify/${encodeURIComponent(code)}`);
+      const data = await res.json();
+      return data;
+    } catch (e) {
+      return { found: false, error: 'Erro ao consultar serviço de verificação pública.' };
     }
   }
 }

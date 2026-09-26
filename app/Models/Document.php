@@ -18,10 +18,14 @@ class Document extends Model
         'holder_name',
         'document_type',
         'course',
+        'area',
         'issue_date',
         'expiry_date',
+        'description',
+        'observations',
         'verification_code',
         'hash',
+        'qr_code',
         'status',
     ];
 
