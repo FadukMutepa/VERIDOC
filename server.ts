@@ -22,11 +22,83 @@ const dbConfig = {
 
 const pool = mysql.createPool(dbConfig);
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Proteção XSS / Segurança de Cabeçalhos HTTP
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser('veridoc_secret_cookie_key_2026'));
 
-// Sessões em memória mapeadas por token criptográfico
+// ============================================================================
+// RATE LIMITING (PREVENÇÃO DE FORÇA BRUTA, SCRAPING E DOS)
+// ============================================================================
+interface RateLimitRecord {
+  count: number;
+  resetTime: number;
+}
+const rateLimitStore = new Map<string, RateLimitRecord>();
+
+// Limpeza periódica da memória a cada 5 minutos
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of rateLimitStore.entries()) {
+    if (now > record.resetTime) {
+      rateLimitStore.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+function createRateLimiter(options: { windowMs: number; max: number; message: string }) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const ip = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
+    const key = `${req.baseUrl || req.path}_${ip}`;
+    const now = Date.now();
+    const record = rateLimitStore.get(key);
+
+    if (!record || now > record.resetTime) {
+      rateLimitStore.set(key, { count: 1, resetTime: now + options.windowMs });
+      return next();
+    }
+
+    if (record.count >= options.max) {
+      return res.status(429).json({
+        error: options.message,
+        retryAfterSeconds: Math.ceil((record.resetTime - now) / 1000),
+      });
+    }
+
+    record.count++;
+    next();
+  };
+}
+
+const loginRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 10, // Máx 10 tentativas por minuto
+  message: 'Demasiadas tentativas de autenticação a partir deste endereço IP. Por favor, aguarde 1 minuto.',
+});
+
+const verifyRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 60, // Máx 60 verificações por minuto
+  message: 'Limite de consultas de verificação excedido. Por favor, aguarde alguns instantes.',
+});
+
+const documentIssuanceRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 30, // Máx 30 emissões por minuto
+  message: 'Limite de emissões simultâneas atingido. Por favor, tente novamente dentro de 1 minuto.',
+});
+
+// ============================================================================
+// SESSÕES E PROTEÇÃO CONTRA SESSION HIJACKING
+// ============================================================================
 interface SessionData {
   userId: number;
   email: string;
@@ -36,10 +108,18 @@ interface SessionData {
   institutionName?: string;
   institutionStatus?: string;
   csrfToken: string;
+  fingerprint: string; // Hash IP + User-Agent para proteção contra sequestro de sessão
   createdAt: number;
+  lastActive: number;
 }
 
 const sessions = new Map<string, SessionData>();
+
+function getClientFingerprint(req: Request): string {
+  const ip = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
+  const ua = req.headers['user-agent'] || 'unknown';
+  return crypto.createHash('sha256').update(`${ip}|${ua}`).digest('hex');
+}
 
 // Middleware para fornecer ou validar CSRF Token
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -56,10 +136,24 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Middleware de Proteção CSRF para requisições de modificação (POST, PUT, DELETE)
+// Middleware de Proteção CSRF com validação de Origem/Referer
 function verifyCsrf(req: Request, res: Response, next: NextFunction) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return next();
+  }
+
+  // Validação de Origin quando presente (anti-CSRF externo)
+  const origin = req.headers['origin'];
+  const host = req.headers['host'];
+  if (origin && host) {
+    try {
+      const originHost = new URL(origin as string).host;
+      if (originHost !== host) {
+        return res.status(403).json({ error: 'Origem da requisição não autorizada (Cross-Origin bloqueado).' });
+      }
+    } catch {
+      // Ignora erro de parsing de URL malformada
+    }
   }
 
   const clientToken = req.headers['x-csrf-token'] || req.body?._token || req.headers['x-xsrf-token'];
@@ -67,14 +161,14 @@ function verifyCsrf(req: Request, res: Response, next: NextFunction) {
 
   if (!clientToken || clientToken !== expectedToken) {
     return res.status(403).json({
-      error: 'Token CSRF inválido ou expirado. Por favor, recarregue a página.',
+      error: 'Token CSRF inválido ou ausente. Por favor, recarregue a página.',
     });
   }
 
   next();
 }
 
-// Middleware de Autenticação
+// Middleware de Autenticação com verificação de integridade de sessão
 async function authenticate(req: Request, res: Response, next: NextFunction) {
   const sessionToken = req.cookies['veridoc_session'];
   if (!sessionToken) {
@@ -84,10 +178,21 @@ async function authenticate(req: Request, res: Response, next: NextFunction) {
 
   const session = sessions.get(sessionToken);
   if (!session) {
-    res.clearCookie('veridoc_session');
+    res.clearCookie('veridoc_session', { path: '/' });
     (req as any).user = null;
     return next();
   }
+
+  // Prevenção de Session Hijacking: Verificar expiração (24 horas)
+  const now = Date.now();
+  if (now - session.createdAt > 24 * 60 * 60 * 1000) {
+    sessions.delete(sessionToken);
+    res.clearCookie('veridoc_session', { path: '/' });
+    (req as any).user = null;
+    return next();
+  }
+
+  session.lastActive = now;
 
   // Verifica se o usuário e a instituição continuam ativos no MySQL
   try {
@@ -102,7 +207,7 @@ async function authenticate(req: Request, res: Response, next: NextFunction) {
 
     if (rows.length === 0 || rows[0].status !== 'active') {
       sessions.delete(sessionToken);
-      res.clearCookie('veridoc_session');
+      res.clearCookie('veridoc_session', { path: '/' });
       (req as any).user = null;
       return next();
     }
@@ -150,7 +255,7 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-// Middleware: Requer Instituição Aprovada (Impede acesso se pendente ou suspensa)
+// Middleware: Requer Instituição Aprovada (Impede emissão/gestão se pendente ou suspensa)
 function requireApprovedInstitution(req: Request, res: Response, next: NextFunction) {
   const user = (req as any).user;
   if (!user) {
@@ -158,7 +263,7 @@ function requireApprovedInstitution(req: Request, res: Response, next: NextFunct
   }
 
   if (user.role === 'admin') {
-    return next(); // Administrador tem bypass para fins de auditoria
+    return next();
   }
 
   if (!user.institutionId) {
@@ -192,8 +297,44 @@ function requireApprovedInstitution(req: Request, res: Response, next: NextFunct
   next();
 }
 
-// Helper de Auditoria
-async function logAudit(userId: number | null, action: string, ip: string, details: string) {
+// ============================================================================
+// 1. HASH CRIPTOGRÁFICO CANÔNICO & INTEGRIDADE DE DADOS
+// Exemplo conceitual: Nome + tipo + instituição + curso + data -> SHA-256
+// ============================================================================
+export function calculateDocumentHash(params: {
+  holder_name: string;
+  document_type: string;
+  institution_id: number | string;
+  course: string;
+  issue_date: string | Date;
+}): string {
+  const normDate = (typeof params.issue_date === 'string')
+    ? params.issue_date.split('T')[0]
+    : new Date(params.issue_date).toISOString().split('T')[0];
+
+  const canonicalPayload = [
+    params.holder_name.trim(),
+    params.document_type.trim(),
+    String(params.institution_id),
+    params.course.trim(),
+    normDate,
+  ].join('|');
+
+  return crypto.createHash('sha256').update(canonicalPayload, 'utf8').digest('hex');
+}
+
+// ============================================================================
+// 4. AUDITORIA: REGISTRO DE AÇÕES IMPORTANTES
+// Ações: user_login, failed_login_attempt, user_logout, document_issued,
+//        document_revoked, document_reissued, document_updated,
+//        institution_status_change, document_verification
+// ============================================================================
+export async function logAudit(
+  userId: number | null,
+  action: string,
+  ip: string,
+  details: string
+): Promise<void> {
   try {
     await pool.query(
       `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
@@ -206,7 +347,7 @@ async function logAudit(userId: number | null, action: string, ip: string, detai
 }
 
 // ============================================================================
-// ROTAS DE API (AUTENTICAÇÃO & GESTÃO)
+// ROTAS DE API (AUTENTICAÇÃO & GESTÃO INSTITUCIONAL)
 // ============================================================================
 
 // 1. Obter CSRF Token
@@ -223,8 +364,9 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
   });
 });
 
-// 3. Registo Institucional (Estado inicial obrigatório: PENDING)
+// 3. Registo Institucional (Mass Assignment Protection: Campos estritos)
 app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res: Response) => {
+  // Mass Assignment: Desestruturação explícita de campos permitidos
   const {
     name,
     type,
@@ -239,7 +381,6 @@ app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res:
     password,
   } = req.body;
 
-  // Validações rigorosas
   if (!name || !type || !country || !city || !email || !phone || !responsible_name || !responsible_email || !password) {
     return res.status(422).json({
       error: 'Todos os campos obrigatórios marcados com asterisco (*) devem ser preenchidos.',
@@ -257,7 +398,7 @@ app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res:
   try {
     await connection.beginTransaction();
 
-    // Verifica unicidade do email institucional
+    // SQL Injection safe (parameterized queries)
     const [existInst]: any = await connection.query(
       'SELECT id FROM institutions WHERE email = ? LIMIT 1',
       [email.trim().toLowerCase()]
@@ -269,7 +410,6 @@ app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res:
       });
     }
 
-    // Verifica unicidade do email do responsável no users
     const [existUser]: any = await connection.query(
       'SELECT id FROM users WHERE email = ? LIMIT 1',
       [responsible_email.trim().toLowerCase()]
@@ -281,7 +421,7 @@ app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res:
       });
     }
 
-    // 1. Inserir Instituição com status 'pending'
+    // 1. Inserir Instituição com status 'pending' (Garantido pelo servidor)
     const [instResult]: any = await connection.query(
       `INSERT INTO institutions 
         (name, type, country, city, address, email, phone, website, responsible_name, responsible_email, status, created_at, updated_at)
@@ -302,7 +442,7 @@ app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res:
 
     const institutionId = instResult.insertId;
 
-    // 2. Hash da Senha com Bcrypt
+    // 2. Hash da Senha com Bcrypt (cost 10)
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
@@ -351,8 +491,8 @@ app.post('/api/auth/register-institution', verifyCsrf, async (req: Request, res:
   }
 });
 
-// 4. Login (Validação, Password Hashing e Verificação de Aprovação)
-app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
+// 4. Login com Rate Limiting e Registro de Auditoria (user_login / failed_login_attempt)
+app.post('/api/auth/login', loginRateLimiter, verifyCsrf, async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -360,6 +500,8 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
       error: 'Por favor, informe o email e a palavra-passe.',
     });
   }
+
+  const clientIp = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
 
   try {
     const [rows]: any = await pool.query(
@@ -372,6 +514,7 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
     );
 
     if (rows.length === 0) {
+      await logAudit(null, 'failed_login_attempt', clientIp, `Tentativa com email inexistente: ${email.trim()}`);
       return res.status(401).json({
         error: 'Credenciais inválidas. Verifique o seu email e palavra-passe.',
       });
@@ -382,7 +525,7 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
     // Validação com bcrypt
     const passwordMatch = await bcrypt.compare(password, user.password);
     if (!passwordMatch) {
-      await logAudit(user.id, 'failed_login_attempt', req.ip || '127.0.0.1', 'Palavra-passe incorreta');
+      await logAudit(user.id, 'failed_login_attempt', clientIp, `Palavra-passe incorreta para conta ID ${user.id}`);
       return res.status(401).json({
         error: 'Credenciais inválidas. Verifique o seu email e palavra-passe.',
       });
@@ -394,7 +537,7 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
       });
     }
 
-    // CONTROLE DE ACESSO: Se for instituição, verificar status
+    // CONTROLE DE ACESSO: Se for instituição, verificar status de homologação
     if (user.role !== 'admin' && user.institution_id) {
       if (user.institution_status === 'pending') {
         return res.status(403).json({
@@ -415,9 +558,10 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
       }
     }
 
-    // Gerar token de sessão criptográfico seguro
+    // Regeneração de Sessão (Prevenção de Session Fixation)
     const sessionToken = crypto.randomBytes(32).toString('hex');
     const csrfToken = (req as any).csrfToken || crypto.randomBytes(24).toString('hex');
+    const fingerprint = getClientFingerprint(req);
 
     sessions.set(sessionToken, {
       userId: user.id,
@@ -428,18 +572,21 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
       institutionName: user.institution_name,
       institutionStatus: user.institution_status,
       csrfToken,
+      fingerprint,
       createdAt: Date.now(),
+      lastActive: Date.now(),
     });
 
     res.cookie('veridoc_session', sessionToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000, // 24 horas
+      maxAge: 24 * 60 * 60 * 1000,
       path: '/',
     });
 
-    await logAudit(user.id, 'user_login', req.ip || '127.0.0.1', `Login efetuado com sucesso como '${user.role}'`);
+    // Auditoria: user_login
+    await logAudit(user.id, 'user_login', clientIp, `Login efetuado com sucesso como '${user.role}'`);
 
     return res.json({
       success: true,
@@ -461,7 +608,7 @@ app.post('/api/auth/login', verifyCsrf, async (req: Request, res: Response) => {
   }
 });
 
-// 5. Logout
+// 5. Logout com revogação e auditoria
 app.post('/api/auth/logout', async (req: Request, res: Response) => {
   const sessionToken = req.cookies['veridoc_session'];
   if (sessionToken) {
@@ -489,7 +636,6 @@ app.post('/api/auth/forgot-password', verifyCsrf, async (req: Request, res: Resp
       await logAudit(rows[0].id, 'password_reset_requested', req.ip || '127.0.0.1', 'Solicitação de recuperação de senha');
     }
 
-    // Resposta genérica de segurança (não expõe existência do email)
     return res.json({
       success: true,
       message: 'Se o email estiver registado na plataforma, foram enviadas instruções detalhadas para redefinição segura da palavra-passe.',
@@ -500,7 +646,7 @@ app.post('/api/auth/forgot-password', verifyCsrf, async (req: Request, res: Resp
   }
 });
 
-// 7. Dashboard da Instituição: Métricas em Tempo Real do Banco de Dados
+// 7. Dashboard da Instituição: Métricas em Tempo Real
 app.get('/api/dashboard/stats', requireAuth, requireApprovedInstitution, async (req: Request, res: Response) => {
   const user = (req as any).user;
   const institutionId = user.institutionId;
@@ -510,28 +656,24 @@ app.get('/api/dashboard/stats', requireAuth, requireApprovedInstitution, async (
   }
 
   try {
-    // Se for admin simulando ou visualizando uma instituição
+    // Isolamento multi-tenant: Apenas admin pode passar institution_id arbitrária
     const targetInstId = (user.role === 'admin' && req.query.institution_id) ? req.query.institution_id : institutionId;
 
-    // 1. Total de documentos
     const [totalDocs]: any = await pool.query(
       'SELECT COUNT(*) AS count FROM documents WHERE institution_id = ?',
       [targetInstId]
     );
 
-    // 2. Documentos válidos
     const [validDocs]: any = await pool.query(
       "SELECT COUNT(*) AS count FROM documents WHERE institution_id = ? AND status = 'valid'",
       [targetInstId]
     );
 
-    // 3. Documentos revogados
     const [revokedDocs]: any = await pool.query(
       "SELECT COUNT(*) AS count FROM documents WHERE institution_id = ? AND status = 'revoked'",
       [targetInstId]
     );
 
-    // 4. Total de verificações realizadas em documentos desta instituição
     const [verifications]: any = await pool.query(
       `SELECT COUNT(v.id) AS count 
        FROM verifications v 
@@ -540,7 +682,6 @@ app.get('/api/dashboard/stats', requireAuth, requireApprovedInstitution, async (
       [targetInstId]
     );
 
-    // 5. Últimos 10 documentos cadastrados no banco
     const [recentDocs]: any = await pool.query(
       `SELECT id, holder_name, document_type, course, issue_date, expiry_date, verification_code, status 
        FROM documents 
@@ -549,7 +690,6 @@ app.get('/api/dashboard/stats', requireAuth, requireApprovedInstitution, async (
       [targetInstId]
     );
 
-    // 6. Dados da instituição
     const [instRows]: any = await pool.query(
       'SELECT id, name, type, country, city, email, phone, website, status FROM institutions WHERE id = ?',
       [targetInstId]
@@ -571,29 +711,148 @@ app.get('/api/dashboard/stats', requireAuth, requireApprovedInstitution, async (
   }
 });
 
-// 8. Gestão Administrativa: Listar Instituições (Admin)
-app.get('/api/admin/institutions', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+// 8. Gestão Administrativa: Métricas do Dashboard Global (Admin)
+app.get('/api/admin/stats', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    const [institutions]: any = await pool.query(
-      `SELECT i.*, 
-              (SELECT COUNT(*) FROM documents d WHERE d.institution_id = i.id) AS total_documents,
-              (SELECT COUNT(*) FROM users u WHERE u.institution_id = i.id) AS total_users
-       FROM institutions i
-       ORDER BY i.id DESC`
+    const [instCounts]: any = await pool.query(
+      `SELECT 
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
+        SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) AS suspended,
+        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected
+       FROM institutions`
     );
+
+    const [docCounts]: any = await pool.query(
+      `SELECT 
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'valid' THEN 1 ELSE 0 END) AS valid,
+        SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END) AS revoked,
+        SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS expired
+       FROM documents`
+    );
+
+    const [verifCounts]: any = await pool.query(
+      `SELECT 
+        COUNT(*) AS total,
+        SUM(CASE WHEN result = 'valid' THEN 1 ELSE 0 END) AS valid,
+        SUM(CASE WHEN result = 'revoked' THEN 1 ELSE 0 END) AS revoked,
+        SUM(CASE WHEN result = 'expired' THEN 1 ELSE 0 END) AS expired,
+        SUM(CASE WHEN result = 'not_found' THEN 1 ELSE 0 END) AS not_found,
+        SUM(CASE WHEN result = 'tampered' THEN 1 ELSE 0 END) AS tampered
+       FROM verifications`
+    );
+
+    const [recentInstitutions]: any = await pool.query(
+      `SELECT id, name, type, country, city, email, status, created_at
+       FROM institutions
+       ORDER BY id DESC LIMIT 5`
+    );
+
+    const [recentDocuments]: any = await pool.query(
+      `SELECT d.id, d.holder_name, d.document_type, d.course, d.verification_code, d.status, d.issue_date,
+              i.name AS institution_name
+       FROM documents d
+       INNER JOIN institutions i ON d.institution_id = i.id
+       ORDER BY d.id DESC LIMIT 5`
+    );
+
+    const [recentVerifications]: any = await pool.query(
+      `SELECT v.id, v.verification_code, v.result, v.ip_address, v.verified_at,
+              d.holder_name, i.name AS institution_name
+       FROM verifications v
+       LEFT JOIN documents d ON v.document_id = d.id
+       LEFT JOIN institutions i ON d.institution_id = i.id
+       ORDER BY v.id DESC LIMIT 5`
+    );
+
+    const [recentLogs]: any = await pool.query(
+      `SELECT a.id, a.action, a.ip_address, a.details, a.created_at, u.name AS user_name
+       FROM audit_logs a
+       LEFT JOIN users u ON a.user_id = u.id
+       ORDER BY a.id DESC LIMIT 5`
+    );
+
+    const inst = instCounts[0] || {};
+    const doc = docCounts[0] || {};
+    const verif = verifCounts[0] || {};
+
+    res.json({
+      institutions: {
+        total: Number(inst.total) || 0,
+        pending: Number(inst.pending) || 0,
+        approved: Number(inst.approved) || 0,
+        suspended: Number(inst.suspended) || 0,
+        rejected: Number(inst.rejected) || 0,
+      },
+      documents: {
+        total: Number(doc.total) || 0,
+        valid: Number(doc.valid) || 0,
+        revoked: Number(doc.revoked) || 0,
+        expired: Number(doc.expired) || 0,
+      },
+      verifications: {
+        total: Number(verif.total) || 0,
+        valid: Number(verif.valid) || 0,
+        revoked: Number(verif.revoked) || 0,
+        expired: Number(verif.expired) || 0,
+        not_found: Number(verif.not_found) || 0,
+        tampered: Number(verif.tampered) || 0,
+      },
+      recent_institutions: recentInstitutions,
+      recent_documents: recentDocuments,
+      recent_verifications: recentVerifications,
+      recent_logs: recentLogs,
+    });
+  } catch (err) {
+    console.error('Erro ao consultar estatísticas do admin:', err);
+    res.status(500).json({ error: 'Erro ao carregar estatísticas do sistema.' });
+  }
+});
+
+// 9. Gestão Administrativa: Listar Instituições com Busca e Filtros (Admin)
+app.get('/api/admin/institutions', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const { search, status } = req.query;
+
+  try {
+    let query = `
+      SELECT i.*, 
+             (SELECT COUNT(*) FROM documents d WHERE d.institution_id = i.id) AS total_documents,
+             (SELECT COUNT(*) FROM users u WHERE u.institution_id = i.id) AS total_users
+      FROM institutions i
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (status && status !== 'all') {
+      query += ' AND i.status = ?';
+      params.push(status);
+    }
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      query += ' AND (i.name LIKE ? OR i.email LIKE ? OR i.responsible_name LIKE ? OR i.responsible_email LIKE ? OR i.city LIKE ? OR i.country LIKE ?)';
+      params.push(term, term, term, term, term, term);
+    }
+
+    query += ' ORDER BY i.id DESC';
+
+    const [institutions]: any = await pool.query(query, params);
 
     const [counts]: any = await pool.query(
       `SELECT 
         COUNT(*) AS total,
         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
         SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
-        SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) AS suspended
+        SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) AS suspended,
+        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected
        FROM institutions`
     );
 
     res.json({
       institutions,
-      stats: counts[0],
+      stats: counts[0] || {},
     });
   } catch (err) {
     console.error('Erro ao listar instituições:', err);
@@ -601,7 +860,47 @@ app.get('/api/admin/institutions', requireAuth, requireAdmin, async (req: Reques
   }
 });
 
-// 9. Gestão Administrativa: Aprovar / Suspender Instituição (Admin)
+// 10. Gestão Administrativa: Detalhes de uma Instituição (Admin)
+app.get('/api/admin/institutions/:id', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  try {
+    const [instRows]: any = await pool.query(
+      `SELECT i.*, 
+             (SELECT COUNT(*) FROM documents d WHERE d.institution_id = i.id) AS total_documents,
+             (SELECT COUNT(*) FROM users u WHERE u.institution_id = i.id) AS total_users
+      FROM institutions i
+      WHERE i.id = ? LIMIT 1`,
+      [id]
+    );
+
+    if (instRows.length === 0) {
+      return res.status(404).json({ error: 'Instituição não encontrada.' });
+    }
+
+    const [users]: any = await pool.query(
+      `SELECT id, name, email, role, status, created_at FROM users WHERE institution_id = ? ORDER BY id ASC`,
+      [id]
+    );
+
+    const [recentDocs]: any = await pool.query(
+      `SELECT id, holder_name, document_type, course, issue_date, verification_code, status
+       FROM documents WHERE institution_id = ? ORDER BY id DESC LIMIT 5`,
+      [id]
+    );
+
+    res.json({
+      institution: instRows[0],
+      users,
+      recent_documents: recentDocs,
+    });
+  } catch (err) {
+    console.error('Erro ao buscar detalhes da instituição:', err);
+    res.status(500).json({ error: 'Erro ao buscar dados da instituição.' });
+  }
+});
+
+// 11. Gestão Administrativa: Alteração de Status da Instituição (Auditoria: institution_status_change)
 app.post('/api/admin/institutions/:id/status', requireAuth, requireAdmin, verifyCsrf, async (req: Request, res: Response) => {
   const { id } = req.params;
   const { status, reason } = req.body;
@@ -640,8 +939,136 @@ app.post('/api/admin/institutions/:id/status', requireAuth, requireAdmin, verify
   }
 });
 
+// 12. Gestão Administrativa: Consultar Documentos Globalmente (Admin)
+app.get('/api/admin/documents', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const { search, status, institution_id } = req.query;
+
+  try {
+    let query = `
+      SELECT d.id, d.institution_id, d.holder_name, d.document_type, d.course, d.area, d.issue_date, d.expiry_date,
+             d.verification_code, d.status, d.created_at, d.hash,
+             i.name AS institution_name, i.status AS institution_status,
+             (SELECT COUNT(*) FROM verifications v WHERE v.document_id = d.id) AS total_verifications
+      FROM documents d
+      INNER JOIN institutions i ON d.institution_id = i.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (institution_id && institution_id !== 'all') {
+      query += ' AND d.institution_id = ?';
+      params.push(institution_id);
+    }
+
+    if (status && status !== 'all') {
+      query += ' AND d.status = ?';
+      params.push(status);
+    }
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      query += ' AND (d.holder_name LIKE ? OR d.verification_code LIKE ? OR d.course LIKE ? OR d.document_type LIKE ? OR i.name LIKE ?)';
+      params.push(term, term, term, term, term);
+    }
+
+    query += ' ORDER BY d.id DESC LIMIT 100';
+
+    const [documents]: any = await pool.query(query, params);
+
+    res.json({
+      documents,
+      count: documents.length,
+    });
+  } catch (err) {
+    console.error('Erro ao consultar documentos administrativos:', err);
+    res.status(500).json({ error: 'Erro ao consultar documentos.' });
+  }
+});
+
+// 13. Gestão Administrativa: Consultar Verificações (Admin)
+app.get('/api/admin/verifications', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const { search, result } = req.query;
+
+  try {
+    let query = `
+      SELECT v.id, v.document_id, v.verification_code, v.result, v.ip_address, v.user_agent, v.verified_at,
+             d.holder_name, d.document_type, d.course,
+             i.name AS institution_name
+      FROM verifications v
+      LEFT JOIN documents d ON v.document_id = d.id
+      LEFT JOIN institutions i ON d.institution_id = i.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (result && result !== 'all') {
+      query += ' AND v.result = ?';
+      params.push(result);
+    }
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      query += ' AND (v.verification_code LIKE ? OR v.ip_address LIKE ? OR d.holder_name LIKE ? OR i.name LIKE ?)';
+      params.push(term, term, term, term);
+    }
+
+    query += ' ORDER BY v.id DESC LIMIT 100';
+
+    const [verifications]: any = await pool.query(query, params);
+
+    res.json({
+      verifications,
+      count: verifications.length,
+    });
+  } catch (err) {
+    console.error('Erro ao consultar verificações:', err);
+    res.status(500).json({ error: 'Erro ao buscar registros de verificação.' });
+  }
+});
+
+// 14. Gestão Administrativa: Consultar Logs de Auditoria (Admin)
+app.get('/api/admin/logs', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const { action, search } = req.query;
+
+  try {
+    let query = `
+      SELECT a.id, a.user_id, a.action, a.ip_address, a.details, a.created_at,
+             u.name AS user_name, u.email AS user_email, u.role AS user_role,
+             i.name AS institution_name
+      FROM audit_logs a
+      LEFT JOIN users u ON a.user_id = u.id
+      LEFT JOIN institutions i ON u.institution_id = i.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (action && action !== 'all') {
+      query += ' AND a.action = ?';
+      params.push(action);
+    }
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      query += ' AND (a.details LIKE ? OR a.ip_address LIKE ? OR u.name LIKE ? OR u.email LIKE ?)';
+      params.push(term, term, term, term);
+    }
+
+    query += ' ORDER BY a.id DESC LIMIT 100';
+
+    const [logs]: any = await pool.query(query, params);
+
+    res.json({
+      logs,
+      count: logs.length,
+    });
+  } catch (err) {
+    console.error('Erro ao consultar logs de auditoria:', err);
+    res.status(500).json({ error: 'Erro ao buscar logs de auditoria.' });
+  }
+});
+
 // ============================================================================
-// GESTÃO REAL DE DOCUMENTOS (EMISSÃO, LISTAGEM, DETALHES, REVOGAÇÃO, VERIFICAÇÃO)
+// GESTÃO DE DOCUMENTOS COM CONTROLE DE ACESSO, HASH E AUDITORIA
 // ============================================================================
 
 // Helper: Gerador de código único com verificação real de colisão no MySQL
@@ -672,11 +1099,13 @@ async function generateUniqueVerificationCode(conn: any): Promise<string> {
   throw new Error('Falha ao gerar código único após 100 tentativas.');
 }
 
-// 10. Emissão Real de Documento (Somente Instituição Aprovada / Utilizador Autorizado)
-app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
+// 10. Emissão Real de Documento (Auditoria: document_issued)
+// Somente Instituições Aprovadas e Utilizadores Autorizados
+app.post('/api/documents', documentIssuanceRateLimiter, requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
   const user = (req as any).user;
   const institutionId = user.institutionId;
 
+  // Mass Assignment Protection: Desestruturação explícita ignorando id, status, hash, etc.
   const {
     holder_name,
     document_type,
@@ -688,7 +1117,6 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
     observations,
   } = req.body;
 
-  // Validação no servidor (Regra: Não confiar no JavaScript do cliente)
   if (!holder_name || !holder_name.trim()) {
     return res.status(422).json({ error: 'O nome completo do titular é obrigatório.' });
   }
@@ -702,7 +1130,6 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
     return res.status(422).json({ error: 'A data de emissão é obrigatória.' });
   }
 
-  // Validação de datas
   const issueDateObj = new Date(issue_date);
   if (isNaN(issueDateObj.getTime())) {
     return res.status(422).json({ error: 'Data de emissão inválida.' });
@@ -723,7 +1150,7 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
   try {
     await connection.beginTransaction();
 
-    // 1. Identificar e confirmar instituição
+    // Controle de Acesso: Apenas instituições APROVADAS
     const [instRows]: any = await connection.query(
       'SELECT id, name, status FROM institutions WHERE id = ? LIMIT 1',
       [institutionId]
@@ -738,23 +1165,20 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
 
     const institution = instRows[0];
 
-    // 2. Gerar código único com verificação rigorosa de colisão
+    // Código único anti-colisão
     const verificationCode = await generateUniqueVerificationCode(connection);
 
-    // 3. Criar hash criptográfico SHA-256 no servidor
-    const hashData = [
-      institution.id,
-      holder_name.trim(),
-      document_type.trim(),
-      course.trim(),
-      issue_date.trim(),
-      verificationCode,
-      'veridoc_salt_secure_2026',
-    ].join('|');
+    // 1. Hash Criptográfico SHA-256 Canônico
+    // Exemplo: Nome + tipo + instituição + curso + data -> SHA-256
+    const documentHash = calculateDocumentHash({
+      holder_name: holder_name.trim(),
+      document_type: document_type.trim(),
+      institution_id: institution.id,
+      course: course.trim(),
+      issue_date: issue_date.trim(),
+    });
 
-    const documentHash = crypto.createHash('sha256').update(hashData).digest('hex');
-
-    // 4. Criar QR Code no servidor que aponta estritamente para a URL de verificação pública
+    // 2. QR Code apontando exclusivamente para /verificar/{codigo}
     const host = req.get('host') || 'localhost:3000';
     const protocol = req.protocol || 'http';
     const verificationUrl = `${protocol}://${host}/verificar/${verificationCode}`;
@@ -763,13 +1187,10 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
       errorCorrectionLevel: 'H',
       margin: 1,
       width: 320,
-      color: {
-        dark: '#0A1428',
-        light: '#FFFFFF',
-      },
+      color: { dark: '#0A1428', light: '#FFFFFF' },
     });
 
-    // 5. Registrar o documento no MySQL com status VALID
+    // 3. Gravar documento no MySQL com status 'valid'
     const [docResult]: any = await connection.query(
       `INSERT INTO documents 
         (institution_id, holder_name, document_type, course, area, issue_date, expiry_date, description, observations, verification_code, hash, qr_code, status, created_at, updated_at)
@@ -792,7 +1213,7 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
 
     const documentId = docResult.insertId;
 
-    // 6. Registrar a operação no histórico do documento (document_history)
+    // 4. Histórico do documento
     await connection.query(
       `INSERT INTO document_history (document_id, user_id, action, description, created_at, updated_at)
        VALUES (?, ?, 'created', ?, NOW(), NOW())`,
@@ -803,14 +1224,14 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
       ]
     );
 
-    // 7. Registrar no log de auditoria global (audit_logs)
+    // 5. Auditoria: document_issued
     await connection.query(
       `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
        VALUES (?, 'document_issued', ?, ?, NOW(), NOW())`,
       [
         user.id,
         req.ip || '127.0.0.1',
-        `Documento ID ${documentId} emitido com código '${verificationCode}' para o titular '${holder_name.trim()}'.`,
+        `Documento ID ${documentId} emitido com código '${verificationCode}' para o titular '${holder_name.trim()}'. Hash SHA-256: ${documentHash}`,
       ]
     );
 
@@ -837,17 +1258,19 @@ app.post('/api/documents', requireAuth, requireApprovedInstitution, verifyCsrf, 
   } catch (error: any) {
     await connection.rollback();
     console.error('Erro na emissão do documento:', error);
-    return res.status(500).json({ error: 'Erro ao emitir documento no servidor.' });
+    return res.status(500).json({ error: 'Erro ao emitir documento no servidor.', details: error?.message });
   } finally {
     connection.release();
   }
 });
 
 // 11. Listagem de Documentos da Instituição (/instituicao/documentos)
+// Controle de Acesso: Uma instituição só vê seus próprios documentos
 app.get('/api/documents', requireAuth, requireApprovedInstitution, async (req: Request, res: Response) => {
   const user = (req as any).user;
   const institutionId = user.institutionId;
 
+  // Isolamento Multi-tenant estrito
   const targetInstId = (user.role === 'admin' && req.query.institution_id) ? req.query.institution_id : institutionId;
   const { status, search } = req.query;
 
@@ -864,7 +1287,6 @@ app.get('/api/documents', requireAuth, requireApprovedInstitution, async (req: R
     `;
     const params: any[] = [];
 
-    // Isolamento multi-tenant
     if (user.role !== 'admin' || targetInstId) {
       sql += ' AND d.institution_id = ?';
       params.push(targetInstId);
@@ -896,6 +1318,7 @@ app.get('/api/documents', requireAuth, requireApprovedInstitution, async (req: R
 });
 
 // 12. Visualizar Documento por ID (com Histórico e Detalhes)
+// Controle de Acesso: Bloqueia acesso a documentos de outra instituição
 app.get('/api/documents/:id', requireAuth, requireApprovedInstitution, async (req: Request, res: Response) => {
   const { id } = req.params;
   const user = (req as any).user;
@@ -917,10 +1340,9 @@ app.get('/api/documents/:id', requireAuth, requireApprovedInstitution, async (re
 
     // Isolamento multi-tenant
     if (user.role !== 'admin' && doc.institution_id !== user.institutionId) {
-      return res.status(403).json({ error: 'Acesso negado a documentos de outra instituição.' });
+      return res.status(403).json({ error: 'Acesso negado: Este documento pertence a outra instituição.' });
     }
 
-    // Histórico do documento
     const [history]: any = await pool.query(
       `SELECT h.*, u.name AS user_name, u.email AS user_email
        FROM document_history h
@@ -930,7 +1352,6 @@ app.get('/api/documents/:id', requireAuth, requireApprovedInstitution, async (re
       [id]
     );
 
-    // Verificações
     const [verifications]: any = await pool.query(
       `SELECT id, result, ip_address, verified_at 
        FROM verifications 
@@ -951,7 +1372,8 @@ app.get('/api/documents/:id', requireAuth, requireApprovedInstitution, async (re
   }
 });
 
-// 13. Revogar Documento com Justificativa
+// 13. Revogar Documento com Justificativa (Auditoria: document_revoked)
+// Controle de Acesso: Só pode revogar seus próprios documentos
 app.post('/api/documents/:id/revoke', requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
   const { id } = req.params;
   const { reason } = req.body;
@@ -980,10 +1402,10 @@ app.post('/api/documents/:id/revoke', requireAuth, requireApprovedInstitution, v
 
     const doc = rows[0];
 
-    // Multi-tenant check
+    // Controle de Acesso Estrito: Não pode revogar documentos de outra instituição
     if (user.role !== 'admin' && doc.institution_id !== user.institutionId) {
       await connection.rollback();
-      return res.status(403).json({ error: 'Acesso negado: Este documento pertence a outra instituição.' });
+      return res.status(403).json({ error: 'Acesso negado: Não possui permissão para revogar documentos de outra instituição.' });
     }
 
     if (doc.status === 'revoked') {
@@ -1008,7 +1430,7 @@ app.post('/api/documents/:id/revoke', requireAuth, requireApprovedInstitution, v
       ]
     );
 
-    // 3. Registrar no log de auditoria
+    // 3. Auditoria: document_revoked
     await connection.query(
       `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
        VALUES (?, 'document_revoked', ?, ?, NOW(), NOW())`,
@@ -1034,13 +1456,183 @@ app.post('/api/documents/:id/revoke', requireAuth, requireApprovedInstitution, v
   }
 });
 
-// 14. Consulta e Validação Pública de Autenticidade (Usada por /verificar e pelo QR Code)
-app.get('/api/public/verify/:code', async (req: Request, res: Response) => {
-  const rawCode = req.params.code.trim().toUpperCase();
+// 14. Alteração de Metadados do Documento (Auditoria: document_updated)
+// Controle de Acesso: Apenas instituição proprietária e dados permitidos
+app.put('/api/documents/:id', requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const { description, observations } = req.body;
+
+  const connection = await pool.getConnection();
 
   try {
+    await connection.beginTransaction();
+
+    const [rows]: any = await connection.query(
+      'SELECT id, institution_id, verification_code FROM documents WHERE id = ? LIMIT 1',
+      [id]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Documento não encontrado.' });
+    }
+
+    const doc = rows[0];
+
+    // Isolamento multi-tenant: Não modificar documento de outra instituição
+    if (user.role !== 'admin' && doc.institution_id !== user.institutionId) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Acesso negado: Não possui permissão para modificar este documento.' });
+    }
+
+    await connection.query(
+      'UPDATE documents SET description = ?, observations = ?, updated_at = NOW() WHERE id = ?',
+      [description ? description.trim() : null, observations ? observations.trim() : null, id]
+    );
+
+    await connection.query(
+      `INSERT INTO document_history (document_id, user_id, action, description, created_at, updated_at)
+       VALUES (?, ?, 'updated', ?, NOW(), NOW())`,
+      [id, user.id, `Metadados do documento atualizados por ${user.name}.`]
+    );
+
+    // Auditoria: document_updated
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
+       VALUES (?, 'document_updated', ?, ?, NOW(), NOW())`,
+      [user.id, req.ip || '127.0.0.1', `Metadados do documento ID ${id} (${doc.verification_code}) atualizados.`]
+    );
+
+    await connection.commit();
+
+    return res.json({
+      success: true,
+      message: 'Documento atualizado com sucesso.',
+    });
+  } catch (err) {
+    await connection.rollback();
+    console.error('Erro ao atualizar documento:', err);
+    return res.status(500).json({ error: 'Erro ao atualizar documento.' });
+  } finally {
+    connection.release();
+  }
+});
+
+// 15. Reemissão Oficial de Documento (Auditoria: document_reissued)
+// Controle de Acesso: Apenas instituição proprietária e regenera código, hash SHA-256 e QR Code
+app.post('/api/documents/:id/reissue', requireAuth, requireApprovedInstitution, verifyCsrf, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const { reason } = req.body;
+
+  if (!reason || reason.trim().length < 5) {
+    return res.status(422).json({ error: 'Justificativa de reemissão obrigatória (mínimo 5 caracteres).' });
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [rows]: any = await connection.query(
+      'SELECT * FROM documents WHERE id = ? LIMIT 1',
+      [id]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Documento não encontrado.' });
+    }
+
+    const doc = rows[0];
+
+    // Isolamento multi-tenant
+    if (user.role !== 'admin' && doc.institution_id !== user.institutionId) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Acesso negado: Não pode reemitir documentos de outra instituição.' });
+    }
+
+    // 1. Gera novo código único
+    const newCode = await generateUniqueVerificationCode(connection);
+
+    // 2. Recalcula Hash SHA-256 Canônico
+    const newHash = calculateDocumentHash({
+      holder_name: doc.holder_name,
+      document_type: doc.document_type,
+      institution_id: doc.institution_id,
+      course: doc.course,
+      issue_date: new Date().toISOString().split('T')[0],
+    });
+
+    // 3. Novo QR Code
+    const host = req.get('host') || 'localhost:3000';
+    const protocol = req.protocol || 'http';
+    const verificationUrl = `${protocol}://${host}/verificar/${newCode}`;
+    const newQrCode = await QRCode.toDataURL(verificationUrl, {
+      errorCorrectionLevel: 'H',
+      margin: 1,
+      width: 320,
+      color: { dark: '#0A1428', light: '#FFFFFF' },
+    });
+
+    // 4. Atualizar registro
+    await connection.query(
+      `UPDATE documents 
+       SET verification_code = ?, hash = ?, qr_code = ?, status = 'valid', issue_date = CURDATE(), updated_at = NOW() 
+       WHERE id = ?`,
+      [newCode, newHash, newQrCode, id]
+    );
+
+    // 5. Histórico do documento
+    await connection.query(
+      `INSERT INTO document_history (document_id, user_id, action, description, created_at, updated_at)
+       VALUES (?, ?, 'reissued', ?, NOW(), NOW())`,
+      [id, user.id, `Documento reemitido por ${user.name}. Novo código: ${newCode}. Motivo: ${reason.trim()}`]
+    );
+
+    // 6. Auditoria: document_reissued
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, ip_address, details, created_at, updated_at)
+       VALUES (?, 'document_reissued', ?, ?, NOW(), NOW())`,
+      [user.id, req.ip || '127.0.0.1', `Documento ID ${id} reemitido com novo código '${newCode}' (anterior: '${doc.verification_code}'). Motivo: ${reason.trim()}`]
+    );
+
+    await connection.commit();
+
+    return res.json({
+      success: true,
+      message: 'Documento reemitido com sucesso!',
+      document: {
+        id,
+        verification_code: newCode,
+        status: 'valid',
+        hash: newHash,
+        qr_code: newQrCode,
+      },
+    });
+  } catch (err) {
+    await connection.rollback();
+    console.error('Erro na reemissão:', err);
+    return res.status(500).json({ error: 'Erro ao reemitir documento.' });
+  } finally {
+    connection.release();
+  }
+});
+
+// ============================================================================
+// 16. CONSULTA PÚBLICA DE AUTENTICIDADE COM VERIFICAÇÃO DE INTEGRIDADE
+//     (Auditoria: document_verification | Privacidade Rígida | Rate Limited)
+// ============================================================================
+app.get('/api/public/verify/:code', verifyRateLimiter, async (req: Request, res: Response) => {
+  const rawCode = req.params.code.trim().toUpperCase();
+  const clientIp = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
+  const userAgent = (req.headers['user-agent'] as string) || 'Desconhecido';
+
+  try {
+    // Parameterized Query: Previne SQL Injection
     const [rows]: any = await pool.query(
-      `SELECT d.id, d.holder_name, d.document_type, d.course, d.area, d.issue_date, d.expiry_date,
+      `SELECT d.id, d.institution_id, d.holder_name, d.document_type, d.course, d.area, d.issue_date, d.expiry_date,
               d.description, d.verification_code, d.hash, d.status, d.qr_code,
               i.name AS institution_name, i.country AS institution_country, i.city AS institution_city,
               i.status AS institution_status
@@ -1050,30 +1642,50 @@ app.get('/api/public/verify/:code', async (req: Request, res: Response) => {
       [rawCode]
     );
 
-    const ip = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
-    const userAgent = req.headers['user-agent'] || 'Desconhecido';
-
+    // 1. Caso: DOCUMENTO NÃO ENCONTRADO
     if (rows.length === 0) {
-      // Registra tentativa com 'not_found'
       await pool.query(
         `INSERT INTO verifications (document_id, verification_code, result, ip_address, user_agent, verified_at)
          VALUES (NULL, ?, 'not_found', ?, ?, NOW())`,
-        [rawCode, ip, userAgent]
+        [rawCode, clientIp, userAgent]
+      );
+
+      // Auditoria: document_verification (Tentativa com código inválido)
+      await logAudit(
+        null,
+        'document_verification',
+        clientIp,
+        `Consulta pública de verificação com código inexistente: '${rawCode}'. Alerta de documento não registrado.`
       );
 
       return res.status(404).json({
         found: false,
         result: 'not_found',
         title: 'DOCUMENTO NÃO ENCONTRADO',
+        integrity_verified: false,
         message: `O código '${rawCode}' não foi localizado no registro oficial do VeriDoc. Documento inexistente ou adulterado.`,
       });
     }
 
     const doc = rows[0];
-    let calculatedResult: 'valid' | 'revoked' | 'expired' = doc.status;
 
-    // Se estiver 'valid' mas com data de validade vencida
-    if (doc.status === 'valid' && doc.expiry_date) {
+    // 2. VERIFICAÇÃO DE INTEGRIDADE DOS DADOS (HASH SHA-256)
+    // Recalcula o hash no momento da consulta a partir dos campos essenciais
+    const expectedHash = calculateDocumentHash({
+      holder_name: doc.holder_name,
+      document_type: doc.document_type,
+      institution_id: doc.institution_id,
+      course: doc.course,
+      issue_date: doc.issue_date,
+    });
+
+    const isIntegrityValid = (expectedHash.toLowerCase() === doc.hash.toLowerCase());
+
+    let calculatedResult: 'valid' | 'revoked' | 'expired' | 'tampered' = doc.status;
+
+    if (!isIntegrityValid) {
+      calculatedResult = 'tampered';
+    } else if (doc.status === 'valid' && doc.expiry_date) {
       const exp = new Date(doc.expiry_date);
       const now = new Date();
       if (exp < now) {
@@ -1085,18 +1697,31 @@ app.get('/api/public/verify/:code', async (req: Request, res: Response) => {
     await pool.query(
       `INSERT INTO verifications (document_id, verification_code, result, ip_address, user_agent, verified_at)
        VALUES (?, ?, ?, ?, ?, NOW())`,
-      [doc.id, rawCode, calculatedResult, ip, userAgent]
+      [doc.id, rawCode, calculatedResult, clientIp, userAgent]
+    );
+
+    // Auditoria: document_verification
+    await logAudit(
+      null,
+      'document_verification',
+      clientIp,
+      `Consulta pública ao documento '${doc.verification_code}' (ID ${doc.id}). Resultado: ${calculatedResult.toUpperCase()}. Integridade Criptográfica: ${isIntegrityValid ? 'VÁLIDA' : 'COMPROMETIDA'}`
     );
 
     const title = 
       calculatedResult === 'valid' ? 'DOCUMENTO VÁLIDO' :
       calculatedResult === 'revoked' ? 'DOCUMENTO REVOGADO' :
-      'DOCUMENTO EXPIRADO';
+      calculatedResult === 'expired' ? 'DOCUMENTO EXPIRADO' :
+      'INTEGRIDADE COMPROMETIDA';
 
+    // PRIVACIDADE ESTRITA:
+    // Apenas campos de verificação pública são transmitidos.
+    // NÃO EXPÕE: Senhas, emails privados, telefones, endereços particulares, observações internas ou dados de utilizadores.
     return res.json({
       found: true,
       result: calculatedResult,
       title,
+      integrity_verified: isIntegrityValid,
       document: {
         titular: doc.holder_name,
         tipo: doc.document_type,

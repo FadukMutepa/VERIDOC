@@ -67,6 +67,61 @@ export interface DocumentHistoryItem {
   user_name?: string;
 }
 
+export interface AdminStats {
+  institutions: {
+    total: number;
+    pending: number;
+    approved: number;
+    suspended: number;
+    rejected: number;
+  };
+  documents: {
+    total: number;
+    valid: number;
+    revoked: number;
+    expired: number;
+  };
+  verifications: {
+    total: number;
+    valid: number;
+    revoked: number;
+    expired: number;
+    not_found: number;
+    tampered: number;
+  };
+  recent_institutions?: any[];
+  recent_documents?: any[];
+  recent_verifications?: any[];
+  recent_logs?: any[];
+}
+
+export interface VerificationItem {
+  id: number;
+  document_id?: number;
+  verification_code: string;
+  result: 'valid' | 'revoked' | 'expired' | 'not_found' | 'tampered';
+  ip_address: string;
+  user_agent?: string;
+  verified_at: string;
+  holder_name?: string;
+  document_type?: string;
+  course?: string;
+  institution_name?: string;
+}
+
+export interface AuditLogItem {
+  id: number;
+  user_id?: number;
+  action: string;
+  ip_address: string;
+  details: string;
+  created_at: string;
+  user_name?: string;
+  user_email?: string;
+  user_role?: string;
+  institution_name?: string;
+}
+
 class AuthService {
   private currentUser: AuthUser | null = null;
   private csrfToken: string | null = null;
@@ -205,9 +260,27 @@ class AuthService {
     }
   }
 
-  public async getAdminInstitutions(): Promise<{ success: boolean; institutions?: InstitutionItem[]; stats?: any; error?: string }> {
+  public async getAdminStats(): Promise<{ success: boolean; stats?: AdminStats; error?: string }> {
     try {
-      const res = await fetch('/api/admin/institutions', { credentials: 'include' });
+      const res = await fetch('/api/admin/stats', { credentials: 'include' });
+      const data = await res.json();
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao carregar estatísticas.' };
+      }
+      return { success: true, stats: data };
+    } catch (e) {
+      return { success: false, error: 'Erro de conexão ao buscar estatísticas do admin.' };
+    }
+  }
+
+  public async getAdminInstitutions(search?: string, status?: string): Promise<{ success: boolean; institutions?: InstitutionItem[]; stats?: any; error?: string }> {
+    try {
+      const params = new URLSearchParams();
+      if (search) params.append('search', search);
+      if (status && status !== 'all') params.append('status', status);
+
+      const url = params.toString() ? `/api/admin/institutions?${params.toString()}` : '/api/admin/institutions';
+      const res = await fetch(url, { credentials: 'include' });
       const data = await res.json();
 
       if (!res.ok) {
@@ -217,6 +290,82 @@ class AuthService {
       return { success: true, institutions: data.institutions, stats: data.stats };
     } catch (e) {
       return { success: false, error: 'Erro ao buscar instituições.' };
+    }
+  }
+
+  public async getAdminInstitution(id: number): Promise<{ success: boolean; institution?: InstitutionItem; users?: any[]; recent_documents?: any[]; error?: string }> {
+    try {
+      const res = await fetch(`/api/admin/institutions/${id}`, { credentials: 'include' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao buscar instituição.' };
+      }
+
+      return { success: true, institution: data.institution, users: data.users, recent_documents: data.recent_documents };
+    } catch (e) {
+      return { success: false, error: 'Erro ao buscar detalhes da instituição.' };
+    }
+  }
+
+  public async getAdminDocuments(search?: string, status?: string, institutionId?: number | string): Promise<{ success: boolean; documents?: DocumentItem[]; count?: number; error?: string }> {
+    try {
+      const params = new URLSearchParams();
+      if (search) params.append('search', search);
+      if (status && status !== 'all') params.append('status', status);
+      if (institutionId && institutionId !== 'all') params.append('institution_id', String(institutionId));
+
+      const url = `/api/admin/documents?${params.toString()}`;
+      const res = await fetch(url, { credentials: 'include' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao carregar documentos.' };
+      }
+
+      return { success: true, documents: data.documents, count: data.count };
+    } catch (e) {
+      return { success: false, error: 'Erro ao buscar documentos administrativos.' };
+    }
+  }
+
+  public async getAdminVerifications(search?: string, result?: string): Promise<{ success: boolean; verifications?: VerificationItem[]; count?: number; error?: string }> {
+    try {
+      const params = new URLSearchParams();
+      if (search) params.append('search', search);
+      if (result && result !== 'all') params.append('result', result);
+
+      const url = `/api/admin/verifications?${params.toString()}`;
+      const res = await fetch(url, { credentials: 'include' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao carregar verificações.' };
+      }
+
+      return { success: true, verifications: data.verifications, count: data.count };
+    } catch (e) {
+      return { success: false, error: 'Erro ao buscar verificações.' };
+    }
+  }
+
+  public async getAdminLogs(action?: string, search?: string): Promise<{ success: boolean; logs?: AuditLogItem[]; count?: number; error?: string }> {
+    try {
+      const params = new URLSearchParams();
+      if (action && action !== 'all') params.append('action', action);
+      if (search) params.append('search', search);
+
+      const url = `/api/admin/logs?${params.toString()}`;
+      const res = await fetch(url, { credentials: 'include' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        return { success: false, error: data.error || 'Erro ao carregar logs.' };
+      }
+
+      return { success: true, logs: data.logs, count: data.count };
+    } catch (e) {
+      return { success: false, error: 'Erro ao buscar logs de auditoria.' };
     }
   }
 

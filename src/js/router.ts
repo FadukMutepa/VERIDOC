@@ -7,7 +7,13 @@ import { renderRegisterPage } from './views/register';
 import { renderDashboardPage } from './views/dashboard';
 import { renderDocumentCreatePage } from './views/document_create';
 import { renderDocumentListPage } from './views/document_list';
+import { renderAdminDashboardPage } from './views/admin_dashboard';
+import { renderAdminInstitutionsPage } from './views/admin_institutions';
+import { renderAdminDocumentsPage } from './views/admin_documents';
+import { renderAdminVerificationsPage } from './views/admin_verifications';
+import { renderAdminLogsPage } from './views/admin_logs';
 import { authService, DocumentItem } from './services/auth';
+import { escapeHtml } from './utils/sanitize';
 
 export class VeriDocRouter {
   private appElement: HTMLElement;
@@ -71,8 +77,40 @@ export class VeriDocRouter {
     // Remove query params para comparação de rota base
     const basePath = normalized.split('?')[0];
 
+    // Controle de Acesso Estrito para Rotas Administrativas (/admin/*)
+    if (basePath.startsWith('/admin')) {
+      if (!authService.isAuthenticated()) {
+        this.currentPath = '/login';
+        this.currentVerifyCode = '';
+        this.render();
+        return;
+      }
+      if (!authService.isAdmin()) {
+        // SEGURANÇA ESTRITA: Um utilizador institucional NUNCA deve conseguir acessar as rotas administrativas
+        this.currentPath = '/instituicao/dashboard';
+        this.currentVerifyCode = '';
+        this.render();
+        return;
+      }
+    }
+
     if (basePath === '' || basePath === '/') {
       this.currentPath = '/';
+      this.currentVerifyCode = '';
+    } else if (basePath.startsWith('/admin/dashboard')) {
+      this.currentPath = '/admin/dashboard';
+      this.currentVerifyCode = '';
+    } else if (basePath.startsWith('/admin/institutions')) {
+      this.currentPath = '/admin/institutions';
+      this.currentVerifyCode = '';
+    } else if (basePath.startsWith('/admin/documents')) {
+      this.currentPath = '/admin/documents';
+      this.currentVerifyCode = '';
+    } else if (basePath.startsWith('/admin/verifications')) {
+      this.currentPath = '/admin/verifications';
+      this.currentVerifyCode = '';
+    } else if (basePath.startsWith('/admin/logs')) {
+      this.currentPath = '/admin/logs';
       this.currentVerifyCode = '';
     } else if (basePath.startsWith('/verificar')) {
       this.currentPath = '/verificar';
@@ -112,9 +150,24 @@ export class VeriDocRouter {
 
     const demoSwitcher = this.renderDemoSwitcher();
     let pageHtml = '';
-    const isDashboard = this.currentPath.includes('/instituicao/');
+    const isDashboard = this.currentPath.includes('/instituicao/') || this.currentPath.startsWith('/admin');
 
     switch (this.currentPath) {
+      case '/admin/dashboard':
+        pageHtml = renderAdminDashboardPage();
+        break;
+      case '/admin/institutions':
+        pageHtml = renderAdminInstitutionsPage();
+        break;
+      case '/admin/documents':
+        pageHtml = renderAdminDocumentsPage();
+        break;
+      case '/admin/verifications':
+        pageHtml = renderAdminVerificationsPage();
+        break;
+      case '/admin/logs':
+        pageHtml = renderAdminLogsPage();
+        break;
       case '/instituicao/documentos/novo':
         pageHtml = renderDocumentCreatePage();
         break;
@@ -163,6 +216,14 @@ export class VeriDocRouter {
       { path: '/instituicao/documentos', label: 'Documentos (/documentos)' },
     ];
 
+    if (user && user.role === 'admin') {
+      pages.push({ path: '/admin/dashboard', label: 'Admin Dashboard' });
+      pages.push({ path: '/admin/institutions', label: 'Admin Instituições' });
+      pages.push({ path: '/admin/documents', label: 'Admin Docs' });
+      pages.push({ path: '/admin/verifications', label: 'Admin Verificações' });
+      pages.push({ path: '/admin/logs', label: 'Admin Logs' });
+    }
+
     return `
       <div class="bg-dark text-white py-2 px-3 border-bottom border-secondary border-opacity-50" style="font-size: 0.8rem; background-color: #050B14 !important;">
         <div class="container d-flex flex-wrap align-items-center justify-content-between gap-2">
@@ -199,6 +260,9 @@ export class VeriDocRouter {
     const dashLogout = document.getElementById('btnDashLogout');
     if (dashLogout) dashLogout.addEventListener('click', handleLogout);
 
+    const adminLogout = document.getElementById('btnAdminLogout');
+    if (adminLogout) adminLogout.addEventListener('click', handleLogout);
+
     // 2. Tela de Emissão de Documento (/instituicao/documentos/novo)
     if (this.currentPath === '/instituicao/documentos/novo') {
       this.attachCreateDocEvents();
@@ -224,9 +288,34 @@ export class VeriDocRouter {
       this.attachRegisterEvents();
     }
 
-    // 7. Dashboard (/instituicao/dashboard)
+    // 7. Dashboard Institucional (/instituicao/dashboard)
     if (this.currentPath === '/instituicao/dashboard') {
       this.loadDashboardData();
+    }
+
+    // 8. Admin Dashboard (/admin/dashboard)
+    if (this.currentPath === '/admin/dashboard') {
+      this.attachAdminDashboardEvents();
+    }
+
+    // 9. Admin Gestão de Instituições (/admin/institutions)
+    if (this.currentPath === '/admin/institutions') {
+      this.attachAdminInstitutionsEvents();
+    }
+
+    // 10. Admin Documentos Globais (/admin/documents)
+    if (this.currentPath === '/admin/documents') {
+      this.attachAdminDocumentsEvents();
+    }
+
+    // 11. Admin Verificações (/admin/verifications)
+    if (this.currentPath === '/admin/verifications') {
+      this.attachAdminVerificationsEvents();
+    }
+
+    // 12. Admin Logs de Auditoria (/admin/logs)
+    if (this.currentPath === '/admin/logs') {
+      this.attachAdminLogsEvents();
     }
   }
 
@@ -444,17 +533,21 @@ export class VeriDocRouter {
         '<span class="badge bg-warning bg-opacity-15 text-warning border border-warning border-opacity-50 px-2 py-1"><i class="bi bi-clock-history me-1"></i>EXPIRED</span>';
 
       const dateStr = doc.issue_date ? new Date(doc.issue_date).toLocaleDateString('pt-PT') : '-';
+      const safeCode = escapeHtml(doc.verification_code);
+      const safeHolder = escapeHtml(doc.holder_name);
+      const safeCourse = escapeHtml(doc.course || 'Geral');
+      const safeType = escapeHtml(doc.document_type);
 
       return `
         <tr>
           <td class="ps-4">
-            <span class="font-monospace fw-bold text-primary">${doc.verification_code}</span>
+            <span class="font-monospace fw-bold text-primary">${safeCode}</span>
           </td>
           <td>
-            <div class="fw-bold text-dark">${doc.holder_name}</div>
-            <div class="text-muted small">${doc.course || 'Geral'}</div>
+            <div class="fw-bold text-dark">${safeHolder}</div>
+            <div class="text-muted small">${safeCourse}</div>
           </td>
-          <td><span class="badge bg-light text-dark border">${doc.document_type}</span></td>
+          <td><span class="badge bg-light text-dark border">${safeType}</span></td>
           <td class="text-muted">${dateStr}</td>
           <td>${statusBadge}</td>
           <td class="text-end pe-4">
@@ -464,12 +557,12 @@ export class VeriDocRouter {
                 <i class="bi bi-eye"></i>
               </button>
               <!-- Verificar -->
-              <a href="/verificar?code=${encodeURIComponent(doc.verification_code)}" data-route="/verificar?code=${encodeURIComponent(doc.verification_code)}" class="btn btn-outline-info" title="Validar na Plataforma">
+              <a href="/verificar/${encodeURIComponent(doc.verification_code)}" data-route="/verificar/${encodeURIComponent(doc.verification_code)}" class="btn btn-outline-info" title="Validar na Plataforma">
                 <i class="bi bi-shield-check"></i>
               </a>
               <!-- Revogar -->
               ${doc.status !== 'revoked' ? `
-                <button class="btn btn-outline-danger btn-action-revoke" data-id="${doc.id}" data-code="${doc.verification_code}" data-holder="${doc.holder_name}" title="Revogar Documento">
+                <button class="btn btn-outline-danger btn-action-revoke" data-id="${doc.id}" data-code="${safeCode}" data-holder="${safeHolder}" title="Revogar Documento">
                   <i class="bi bi-slash-circle"></i>
                 </button>
               ` : `
@@ -565,26 +658,34 @@ export class VeriDocRouter {
 
     const issueDateStr = doc.issue_date ? new Date(doc.issue_date).toLocaleDateString('pt-PT') : '-';
     const expiryDateStr = doc.expiry_date ? new Date(doc.expiry_date).toLocaleDateString('pt-PT') : 'Vitalício';
+    const safeCode = escapeHtml(doc.verification_code);
+    const safeHolder = escapeHtml(doc.holder_name);
+    const safeCourse = escapeHtml(doc.course);
+    const safeArea = escapeHtml(doc.area || '');
+    const safeInst = escapeHtml(doc.institution_name || 'Instituição Homologada');
+    const safeType = escapeHtml(doc.document_type);
+    const safeDesc = escapeHtml(doc.description || '');
+    const safeHash = escapeHtml(doc.hash);
 
     modalBody.innerHTML = `
       <div class="bg-white p-4 rounded-4 border border-light-subtle shadow-sm mb-4">
         <div class="row align-items-center g-4">
           <div class="col-md-8">
             <div class="d-flex align-items-center gap-2 mb-2">
-              <span class="font-monospace fw-bold fs-4 text-primary">${doc.verification_code}</span>
+              <span class="font-monospace fw-bold fs-4 text-primary">${safeCode}</span>
               ${statusBadge}
             </div>
-            <h4 class="fw-bold text-dark mb-1">${doc.holder_name}</h4>
-            <div class="text-secondary small mb-3">${doc.course} ${doc.area ? `· ${doc.area}` : ''}</div>
+            <h4 class="fw-bold text-dark mb-1">${safeHolder}</h4>
+            <div class="text-secondary small mb-3">${safeCourse} ${safeArea ? `· ${safeArea}` : ''}</div>
 
             <div class="row g-2 small border-top pt-3">
               <div class="col-6">
                 <span class="text-muted d-block">Entidade Emissora:</span>
-                <strong>${doc.institution_name || 'Instituição Homologada'}</strong>
+                <strong>${safeInst}</strong>
               </div>
               <div class="col-6">
                 <span class="text-muted d-block">Tipo de Documento:</span>
-                <strong>${doc.document_type}</strong>
+                <strong>${safeType}</strong>
               </div>
               <div class="col-6">
                 <span class="text-muted d-block">Data de Emissão:</span>
@@ -598,13 +699,13 @@ export class VeriDocRouter {
 
             ${doc.description ? `
               <div class="mt-3 p-2 bg-light rounded text-secondary small">
-                <strong>Descrição:</strong> ${doc.description}
+                <strong>Descrição:</strong> ${safeDesc}
               </div>
             ` : ''}
 
             <div class="mt-3 p-2 bg-dark text-secondary rounded font-monospace small text-break" style="font-size: 0.68rem;">
-              <span class="text-white">Hash Criptográfico SHA-256:</span><br>
-              <span class="text-info">${doc.hash}</span>
+              <span class="text-white">Hash Criptográfico SHA-256 (Canônico):</span><br>
+              <span class="text-info">${safeHash}</span>
             </div>
           </div>
 
@@ -625,13 +726,13 @@ export class VeriDocRouter {
         <div class="timeline small">
           ${history.length === 0 ? '<div class="text-muted">Nenhum evento registrado.</div>' : history.map(h => `
             <div class="d-flex gap-2 mb-2 pb-2 border-bottom border-light-subtle">
-              <span class="badge ${h.action === 'created' ? 'bg-success' : 'bg-danger'} text-uppercase" style="font-size: 0.68rem; height: fit-content;">
-                ${h.action}
+              <span class="badge ${h.action === 'created' ? 'bg-success' : h.action === 'reissued' ? 'bg-info text-dark' : h.action === 'updated' ? 'bg-warning text-dark' : 'bg-danger'} text-uppercase" style="font-size: 0.68rem; height: fit-content;">
+                ${escapeHtml(h.action)}
               </span>
               <div class="flex-grow-1">
-                <div class="text-dark fw-semibold">${h.description}</div>
+                <div class="text-dark fw-semibold">${escapeHtml(h.description)}</div>
                 <div class="text-muted" style="font-size: 0.72rem;">
-                  Operador: ${h.user_name || 'Sistema'} · ${new Date(h.created_at).toLocaleString('pt-PT')}
+                  Operador: ${escapeHtml(h.user_name || 'Sistema')} · ${new Date(h.created_at).toLocaleString('pt-PT')}
                 </div>
               </div>
             </div>
@@ -971,10 +1072,10 @@ export class VeriDocRouter {
 
           return `
             <tr>
-              <td class="ps-4 font-monospace fw-bold text-primary">${doc.verification_code}</td>
-              <td class="fw-semibold">${doc.document_type}</td>
-              <td>${doc.holder_name}</td>
-              <td>${doc.course || 'Geral'}</td>
+              <td class="ps-4 font-monospace fw-bold text-primary">${escapeHtml(doc.verification_code)}</td>
+              <td class="fw-semibold">${escapeHtml(doc.document_type)}</td>
+              <td>${escapeHtml(doc.holder_name)}</td>
+              <td>${escapeHtml(doc.course || 'Geral')}</td>
               <td class="text-muted">${formattedDate}</td>
               <td>${statusBadge}</td>
             </tr>
@@ -995,47 +1096,363 @@ export class VeriDocRouter {
   }
 
   private async loadAdminInstitutions(): Promise<void> {
-    const tableBody = document.getElementById('adminInstitutionsTableBody');
+    await this.loadAdminInstitutionsList();
+  }
+
+  // ==========================================================================
+  // MÉTODOS DO PAINEL ADMINISTRATIVO (ROLE: ADMIN)
+  // ==========================================================================
+
+  /**
+   * 1. Dashboard Administrativo (/admin/dashboard)
+   * Carrega e monitora os 7 KPIs e tabelas em tempo real
+   */
+  private async attachAdminDashboardEvents(): Promise<void> {
+    const btnRefresh = document.getElementById('btnRefreshAdminStats');
+    if (btnRefresh) {
+      btnRefresh.addEventListener('click', () => this.loadAdminDashboardStats());
+    }
+
+    await this.loadAdminDashboardStats();
+  }
+
+  private async loadAdminDashboardStats(): Promise<void> {
+    const res = await authService.getAdminStats();
+    if (!res.success || !res.stats) return;
+
+    const stats = res.stats;
+
+    // 1. Número de instituições
+    const elInstTotal = document.getElementById('kpiTotalInstitutions');
+    if (elInstTotal) elInstTotal.textContent = stats.institutions.total.toString();
+
+    // 2. Instituições pendentes
+    const elInstPending = document.getElementById('kpiPendingInstitutions');
+    if (elInstPending) elInstPending.textContent = stats.institutions.pending.toString();
+
+    // 3. Instituições aprovadas
+    const elInstApproved = document.getElementById('kpiApprovedInstitutions');
+    if (elInstApproved) elInstApproved.textContent = stats.institutions.approved.toString();
+
+    // 4. Documentos emitidos
+    const elDocsTotal = document.getElementById('kpiTotalDocuments');
+    if (elDocsTotal) elDocsTotal.textContent = stats.documents.total.toString();
+
+    // 5. Documentos válidos
+    const elDocsValid = document.getElementById('kpiValidDocuments');
+    if (elDocsValid) elDocsValid.textContent = stats.documents.valid.toString();
+
+    // 6. Documentos revogados
+    const elDocsRevoked = document.getElementById('kpiRevokedDocuments');
+    if (elDocsRevoked) elDocsRevoked.textContent = stats.documents.revoked.toString();
+
+    // 7. Total de verificações
+    const elVerifTotal = document.getElementById('kpiTotalVerifications');
+    if (elVerifTotal) elVerifTotal.textContent = stats.verifications.total.toString();
+
+    // Alerta de Pendências
+    const alertBox = document.getElementById('adminPendingAlert');
+    const alertCount = document.getElementById('pendingAlertCount');
+    const sidebarBadge = document.getElementById('adminSidebarPendingBadge');
+
+    if (stats.institutions.pending > 0) {
+      if (alertBox) alertBox.classList.remove('d-none');
+      if (alertCount) alertCount.textContent = stats.institutions.pending.toString();
+      if (sidebarBadge) {
+        sidebarBadge.textContent = stats.institutions.pending.toString();
+        sidebarBadge.classList.remove('d-none');
+      }
+    } else {
+      if (alertBox) alertBox.classList.add('d-none');
+      if (sidebarBadge) sidebarBadge.classList.add('d-none');
+    }
+
+    // Tabela de Instituições Recentes
+    const tblInst = document.getElementById('tblRecentInstitutions');
+    if (tblInst) {
+      const recInst = stats.recent_institutions || [];
+      if (recInst.length === 0) {
+        tblInst.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-muted">Nenhuma instituição registada.</td></tr>`;
+      } else {
+        tblInst.innerHTML = recInst.map((item: any) => {
+          const badgeClass = item.status === 'approved' ? 'bg-success' : item.status === 'pending' ? 'bg-warning text-dark' : 'bg-danger';
+          return `
+            <tr>
+              <td>
+                <div class="fw-bold text-dark">${escapeHtml(item.name)}</div>
+                <div class="text-muted small">${escapeHtml(item.city)}, ${escapeHtml(item.country)}</div>
+              </td>
+              <td><span class="badge bg-light text-dark border">${escapeHtml(item.type)}</span></td>
+              <td><span class="badge ${badgeClass} text-uppercase px-2 py-1">${item.status}</span></td>
+              <td class="text-end">
+                <a href="/admin/institutions" data-route="/admin/institutions" class="btn btn-outline-primary btn-sm py-0 px-2" style="font-size: 0.72rem;">
+                  Gerir
+                </a>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      }
+    }
+
+    // Tabela de Verificações Recentes
+    const tblVerif = document.getElementById('tblRecentVerifications');
+    if (tblVerif) {
+      const recVerif = stats.recent_verifications || [];
+      if (recVerif.length === 0) {
+        tblVerif.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-muted">Nenhuma verificação realizada ainda.</td></tr>`;
+      } else {
+        tblVerif.innerHTML = recVerif.map((item: any) => {
+          const isOk = item.result === 'valid';
+          const isRev = item.result === 'revoked';
+          const badgeClass = isOk ? 'bg-success' : isRev ? 'bg-danger' : 'bg-warning text-dark';
+          const dateStr = item.verified_at ? new Date(item.verified_at).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) : '-';
+
+          return `
+            <tr>
+              <td>
+                <span class="font-monospace fw-bold text-primary">${escapeHtml(item.verification_code)}</span>
+              </td>
+              <td><span class="badge ${badgeClass} text-uppercase px-2 py-1">${escapeHtml(item.result)}</span></td>
+              <td><span class="text-muted font-monospace small">${escapeHtml(item.ip_address || '-')}</span></td>
+              <td class="text-muted small">${dateStr}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+    }
+  }
+
+  /**
+   * 2. Gestão de Instituições (/admin/institutions)
+   * Pesquisa, filtros, aprovação, suspensão, rejeição e visualização detalhada
+   */
+  private currentInstFilterStatus: string = 'all';
+  private currentInstSearchQuery: string = '';
+
+  private attachAdminInstitutionsEvents(): void {
+    const inputSearch = document.getElementById('inputSearchInstitutions') as HTMLInputElement | null;
+    const selectStatus = document.getElementById('selectStatusFilter') as HTMLSelectElement | null;
+    const btnClear = document.getElementById('btnClearSearch');
+    const btnRefresh = document.getElementById('btnRefreshInstitutions');
+
+    // Parse URL params se houver (ex: /admin/institutions?status=pending)
+    const urlParams = new URLSearchParams(window.location.search);
+    const initialStatus = urlParams.get('status');
+    if (initialStatus && selectStatus) {
+      selectStatus.value = initialStatus;
+      this.currentInstFilterStatus = initialStatus;
+    }
+
+    if (inputSearch) {
+      inputSearch.addEventListener('input', () => {
+        this.currentInstSearchQuery = inputSearch.value.trim();
+        this.loadAdminInstitutionsList();
+      });
+    }
+
+    if (btnClear && inputSearch) {
+      btnClear.addEventListener('click', () => {
+        inputSearch.value = '';
+        this.currentInstSearchQuery = '';
+        this.loadAdminInstitutionsList();
+      });
+    }
+
+    if (selectStatus) {
+      selectStatus.addEventListener('change', () => {
+        this.currentInstFilterStatus = selectStatus.value;
+        this.loadAdminInstitutionsList();
+      });
+    }
+
+    if (btnRefresh) {
+      btnRefresh.addEventListener('click', () => this.loadAdminInstitutionsList());
+    }
+
+    // Clique nos cards estatísticos superiores como filtro rápido
+    document.querySelectorAll('.institution-stat-card').forEach(card => {
+      card.addEventListener('click', () => {
+        const filter = card.getAttribute('data-filter') || 'all';
+        this.currentInstFilterStatus = filter;
+        if (selectStatus) selectStatus.value = filter;
+        this.loadAdminInstitutionsList();
+      });
+    });
+
+    // Submissão do Modal de Mudança de Status
+    const btnConfirmStatus = document.getElementById('btnConfirmStatusChange');
+    if (btnConfirmStatus) {
+      btnConfirmStatus.addEventListener('click', async () => {
+        const instId = Number((document.getElementById('changeStatusInstId') as HTMLInputElement)?.value);
+        const newStatus = (document.getElementById('changeStatusNewStatus') as HTMLInputElement)?.value;
+        const reason = (document.getElementById('changeStatusReason') as HTMLTextAreaElement)?.value;
+
+        if (!instId || !newStatus) return;
+
+        btnConfirmStatus.setAttribute('disabled', 'true');
+        btnConfirmStatus.textContent = 'A processar...';
+
+        const res = await authService.updateInstitutionStatus(instId, newStatus, reason);
+
+        btnConfirmStatus.removeAttribute('disabled');
+        btnConfirmStatus.textContent = 'Confirmar Alteração';
+
+        // Fecha modal
+        const modalEl = document.getElementById('modalChangeStatus');
+        if (modalEl) {
+          ((window as any).bootstrap?.Modal?.getInstance(modalEl))?.hide();
+        }
+
+        if (res.success) {
+          await this.loadAdminInstitutionsList();
+        } else {
+          alert('Erro ao alterar status: ' + (res.error || 'Erro desconhecido.'));
+        }
+      });
+    }
+
+    this.loadAdminInstitutionsList();
+  }
+
+  private async loadAdminInstitutionsList(): Promise<void> {
+    const tableBody = document.getElementById('institutionsTableBody');
+    const countBadge = document.getElementById('countInstitutionsShown');
     if (!tableBody) return;
 
-    tableBody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-muted">A consultar base de dados...</td></tr>`;
+    tableBody.innerHTML = `
+      <tr>
+        <td colspan="8" class="text-center py-5 text-muted">
+          <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+          A consultar base de dados MySQL...
+        </td>
+      </tr>
+    `;
 
-    const res = await authService.getAdminInstitutions();
+    const res = await authService.getAdminInstitutions(this.currentInstSearchQuery, this.currentInstFilterStatus);
     if (!res.success || !res.institutions) {
-      tableBody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-danger">Falha ao buscar instituições: ${res.error}</td></tr>`;
+      tableBody.innerHTML = `
+        <tr>
+          <td colspan="8" class="text-center py-4 text-danger">
+            <i class="bi bi-exclamation-circle me-1"></i> Falha ao carregar instituições: ${res.error}
+          </td>
+        </tr>
+      `;
       return;
     }
 
-    tableBody.innerHTML = res.institutions.map(inst => {
+    const institutions = res.institutions;
+    const stats = res.stats || {};
+
+    // Atualiza contadores superiores
+    const elTot = document.getElementById('statInstTotal');
+    const elPend = document.getElementById('statInstPending');
+    const elApp = document.getElementById('statInstApproved');
+    const elSusp = document.getElementById('statInstSuspended');
+
+    if (elTot) elTot.textContent = stats.total?.toString() || '0';
+    if (elPend) elPend.textContent = stats.pending?.toString() || '0';
+    if (elApp) elApp.textContent = stats.approved?.toString() || '0';
+    if (elSusp) elSusp.textContent = stats.suspended?.toString() || '0';
+
+    if (countBadge) countBadge.textContent = institutions.length.toString();
+
+    if (institutions.length === 0) {
+      tableBody.innerHTML = `
+        <tr>
+          <td colspan="8" class="text-center py-5 text-muted">
+            <i class="bi bi-search fs-3 d-block mb-2 text-secondary"></i>
+            Nenhuma instituição encontrada para os filtros selecionados.
+          </td>
+        </tr>
+      `;
+      return;
+    }
+
+    tableBody.innerHTML = institutions.map(inst => {
+      const isApproved = inst.status === 'approved';
+      const isPending = inst.status === 'pending';
+      const isSuspended = inst.status === 'suspended';
+      const isRejected = inst.status === 'rejected';
+
       const statusBadge = 
-        inst.status === 'approved' ? '<span class="badge bg-success px-2 py-1">APPROVED</span>' :
-        inst.status === 'pending' ? '<span class="badge bg-warning text-dark px-2 py-1">PENDING</span>' :
-        '<span class="badge bg-danger px-2 py-1">SUSPENDED</span>';
+        isApproved ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 px-2.5 py-1">APROVADA</span>' :
+        isPending ? '<span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-25 px-2.5 py-1">PENDENTE</span>' :
+        isSuspended ? '<span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 px-2.5 py-1">SUSPENSA</span>' :
+        '<span class="badge bg-secondary px-2.5 py-1">REJEITADA</span>';
 
       return `
         <tr>
-          <td class="ps-4 fw-bold text-muted">#${inst.id}</td>
+          <td class="fw-bold text-muted font-monospace">#${inst.id}</td>
           <td>
-            <div class="fw-bold text-dark">${inst.name}</div>
-            <div class="text-muted small">${inst.city}, ${inst.country}</div>
+            <div class="fw-bold text-dark">${escapeHtml(inst.name)}</div>
+            <span class="text-muted small font-monospace">${escapeHtml(inst.email)}</span>
           </td>
-          <td><span class="badge bg-light text-dark border">${inst.type}</span></td>
-          <td><span class="font-monospace small">${inst.email}</span></td>
           <td>
-            <div>${inst.responsible_name}</div>
-            <div class="text-muted small">${inst.responsible_email}</div>
+            <span class="badge bg-light text-dark border small">${escapeHtml(inst.type)}</span>
+          </td>
+          <td>
+            <div class="text-dark small">${escapeHtml(inst.city)}, ${escapeHtml(inst.country)}</div>
+          </td>
+          <td>
+            <div class="text-dark small fw-semibold">${escapeHtml(inst.responsible_name)}</div>
+            <span class="text-muted small" style="font-size: 0.72rem;">${escapeHtml(inst.responsible_email)}</span>
+          </td>
+          <td>
+            <span class="badge bg-light text-dark border font-monospace">${inst.total_documents || 0}</span>
           </td>
           <td>${statusBadge}</td>
-          <td class="text-end pe-4">
+          <td class="text-end">
             <div class="btn-group btn-group-sm">
-              ${inst.status !== 'approved' ? `
-                <button class="btn btn-sm btn-success btn-action-status" data-id="${inst.id}" data-status="approved">
-                  <i class="bi bi-check-lg me-1"></i> Aprovar
+              <!-- Visualizar -->
+              <button 
+                type="button" 
+                class="btn btn-outline-secondary btn-sm btn-view-inst" 
+                data-id="${inst.id}" 
+                title="Visualizar Detalhes"
+              >
+                <i class="bi bi-eye"></i>
+              </button>
+
+              <!-- Aprovar (se não estiver aprovada) -->
+              ${!isApproved ? `
+                <button 
+                  type="button" 
+                  class="btn btn-outline-success btn-sm btn-action-modal-status" 
+                  data-id="${inst.id}" 
+                  data-name="${escapeHtml(inst.name)}" 
+                  data-status="approved" 
+                  title="Aprovar Instituição"
+                >
+                  <i class="bi bi-check-lg"></i>
                 </button>
               ` : ''}
-              ${inst.status !== 'suspended' ? `
-                <button class="btn btn-sm btn-outline-danger btn-action-status" data-id="${inst.id}" data-status="suspended">
-                  <i class="bi bi-slash-circle me-1"></i> Suspender
+
+              <!-- Suspender (se aprovada) -->
+              ${isApproved ? `
+                <button 
+                  type="button" 
+                  class="btn btn-outline-warning btn-sm btn-action-modal-status" 
+                  data-id="${inst.id}" 
+                  data-name="${escapeHtml(inst.name)}" 
+                  data-status="suspended" 
+                  title="Suspender Acesso"
+                >
+                  <i class="bi bi-pause-circle"></i>
+                </button>
+              ` : ''}
+
+              <!-- Rejeitar (se pendente) -->
+              ${isPending ? `
+                <button 
+                  type="button" 
+                  class="btn btn-outline-danger btn-sm btn-action-modal-status" 
+                  data-id="${inst.id}" 
+                  data-name="${escapeHtml(inst.name)}" 
+                  data-status="rejected" 
+                  title="Rejeitar Candidatura"
+                >
+                  <i class="bi bi-x-circle"></i>
                 </button>
               ` : ''}
             </div>
@@ -1044,17 +1461,455 @@ export class VeriDocRouter {
       `;
     }).join('');
 
-    document.querySelectorAll('.btn-action-status').forEach(btn => {
+    // Eventos dos botões da tabela
+    // 1. Botão Visualizar
+    document.querySelectorAll('.btn-view-inst').forEach(btn => {
       btn.addEventListener('click', async (e) => {
-        const target = (e.currentTarget as HTMLElement);
-        const instId = Number(target.getAttribute('data-id'));
-        const newStatus = target.getAttribute('data-status') || 'approved';
+        const id = Number((e.currentTarget as HTMLElement).getAttribute('data-id'));
+        await this.showInstitutionDetailsModal(id);
+      });
+    });
 
-        target.setAttribute('disabled', 'true');
-        await authService.updateInstitutionStatus(instId, newStatus);
-        await this.loadAdminInstitutions();
-        await this.updateAdminPendingBadge();
+    // 2. Botão Abrir Modal de Status
+    document.querySelectorAll('.btn-action-modal-status').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const el = (e.currentTarget as HTMLElement);
+        const id = el.getAttribute('data-id') || '';
+        const name = el.getAttribute('data-name') || '';
+        const status = el.getAttribute('data-status') || 'approved';
+
+        const titleEl = document.getElementById('changeStatusTitle');
+        const promptEl = document.getElementById('changeStatusPrompt');
+        const idInput = document.getElementById('changeStatusInstId') as HTMLInputElement | null;
+        const statusInput = document.getElementById('changeStatusNewStatus') as HTMLInputElement | null;
+        const reasonInput = document.getElementById('changeStatusReason') as HTMLTextAreaElement | null;
+
+        if (idInput) idInput.value = id;
+        if (statusInput) statusInput.value = status;
+        if (reasonInput) reasonInput.value = '';
+
+        if (titleEl) {
+          titleEl.innerHTML = status === 'approved' 
+            ? '<i class="bi bi-shield-check text-success me-2"></i> Aprovar Instituição' 
+            : status === 'suspended'
+            ? '<i class="bi bi-slash-circle text-warning me-2"></i> Suspender Instituição'
+            : '<i class="bi bi-x-circle text-danger me-2"></i> Rejeitar Candidatura';
+        }
+
+        if (promptEl) {
+          promptEl.innerHTML = `Você está prestes a alterar o status da instituição <strong>${name}</strong> para <strong>${status.toUpperCase()}</strong>.`;
+        }
+
+        const modalEl = document.getElementById('modalChangeStatus');
+        if (modalEl) {
+          ((window as any).bootstrap?.Modal?.getOrCreateInstance(modalEl))?.show();
+        }
       });
     });
   }
+
+  private async showInstitutionDetailsModal(id: number): Promise<void> {
+    const modalEl = document.getElementById('modalViewInstitution');
+    const modalBody = document.getElementById('modalViewInstitutionBody');
+    if (!modalEl || !modalBody) return;
+
+    modalBody.innerHTML = `
+      <div class="text-center py-5">
+        <div class="spinner-border text-primary mb-2"></div>
+        <div class="text-muted small">A carregar detalhes da instituição...</div>
+      </div>
+    `;
+
+    ((window as any).bootstrap?.Modal?.getOrCreateInstance(modalEl))?.show();
+
+    const res = await authService.getAdminInstitution(id);
+    if (!res.success || !res.institution) {
+      modalBody.innerHTML = `<div class="alert alert-danger">Falha ao buscar dados da instituição: ${res.error}</div>`;
+      return;
+    }
+
+    const inst = res.institution;
+    const users = res.users || [];
+    const recentDocs = res.recent_documents || [];
+    const dateStr = inst.created_at ? new Date(inst.created_at).toLocaleDateString('pt-PT') : '-';
+
+    modalBody.innerHTML = `
+      <div class="row g-4">
+        <!-- Coluna 1: Dados Institucionais -->
+        <div class="col-md-6">
+          <div class="p-3 bg-light rounded-3 h-100">
+            <h6 class="fw-bold text-dark border-bottom pb-2 mb-3">
+              <i class="bi bi-building me-1 text-primary"></i> Identificação Institucional
+            </h6>
+            <div class="mb-2">
+              <span class="text-muted small d-block">Nome Oficial:</span>
+              <strong class="text-dark">${escapeHtml(inst.name)}</strong>
+            </div>
+            <div class="mb-2">
+              <span class="text-muted small d-block">Tipo de Entidade:</span>
+              <span class="badge bg-secondary">${escapeHtml(inst.type)}</span>
+            </div>
+            <div class="mb-2">
+              <span class="text-muted small d-block">Localização:</span>
+              <span class="text-dark">${escapeHtml(inst.city)}, ${escapeHtml(inst.country)}</span>
+            </div>
+            <div class="mb-2">
+              <span class="text-muted small d-block">Email de Contato:</span>
+              <span class="font-monospace small text-primary">${escapeHtml(inst.email)}</span>
+            </div>
+            <div class="mb-2">
+              <span class="text-muted small d-block">Data de Registro:</span>
+              <span class="text-dark">${dateStr}</span>
+            </div>
+            <div>
+              <span class="text-muted small d-block">Estado Atual:</span>
+              <span class="badge ${inst.status === 'approved' ? 'bg-success' : inst.status === 'pending' ? 'bg-warning text-dark' : 'bg-danger'} text-uppercase px-2.5 py-1">
+                ${inst.status}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Coluna 2: Responsável e Estatísticas -->
+        <div class="col-md-6">
+          <div class="p-3 bg-light rounded-3 h-100">
+            <h6 class="fw-bold text-dark border-bottom pb-2 mb-3">
+              <i class="bi bi-person-badge me-1 text-primary"></i> Responsável Legal
+            </h6>
+            <div class="mb-2">
+              <span class="text-muted small d-block">Nome do Responsável:</span>
+              <strong class="text-dark">${escapeHtml(inst.responsible_name)}</strong>
+            </div>
+            <div class="mb-3">
+              <span class="text-muted small d-block">Email Institucional:</span>
+              <span class="font-monospace small text-primary">${escapeHtml(inst.responsible_email)}</span>
+            </div>
+
+            <h6 class="fw-bold text-dark border-bottom pb-2 mb-2">
+              <i class="bi bi-bar-chart me-1 text-primary"></i> Atividade na Plataforma
+            </h6>
+            <div class="row g-2">
+              <div class="col-6">
+                <div class="p-2 bg-white rounded border text-center">
+                  <span class="text-muted small d-block">Documentos</span>
+                  <span class="fs-5 fw-bold text-dark">${inst.total_documents || 0}</span>
+                </div>
+              </div>
+              <div class="col-6">
+                <div class="p-2 bg-white rounded border text-center">
+                  <span class="text-muted small d-block">Operadores</span>
+                  <span class="fs-5 fw-bold text-dark">${inst.total_users || users.length || 0}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Lista de Usuários Operadores -->
+        <div class="col-12">
+          <h6 class="fw-bold text-dark mb-2">
+            <i class="bi bi-people me-1 text-primary"></i> Utilizadores Vinculados (${users.length})
+          </h6>
+          <div class="table-responsive bg-white border rounded">
+            <table class="table table-sm table-hover mb-0 small">
+              <thead class="table-light">
+                <tr>
+                  <th>Nome</th>
+                  <th>Email</th>
+                  <th>Perfil (Role)</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${users.length === 0 ? '<tr><td colspan="4" class="text-center py-2 text-muted">Nenhum operador vinculado.</td></tr>' : users.map(u => `
+                  <tr>
+                    <td>${escapeHtml(u.name)}</td>
+                    <td class="font-monospace">${escapeHtml(u.email)}</td>
+                    <td><span class="badge bg-light text-dark border">${escapeHtml(u.role)}</span></td>
+                    <td><span class="badge bg-success bg-opacity-10 text-success">${escapeHtml(u.status)}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Últimos Documentos Emitidos -->
+        <div class="col-12">
+          <h6 class="fw-bold text-dark mb-2">
+            <i class="bi bi-file-earmark-check me-1 text-primary"></i> Últimos Documentos Emitidos (${recentDocs.length})
+          </h6>
+          <div class="table-responsive bg-white border rounded">
+            <table class="table table-sm table-hover mb-0 small">
+              <thead class="table-light">
+                <tr>
+                  <th>Código</th>
+                  <th>Titular</th>
+                  <th>Tipo / Curso</th>
+                  <th>Data</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${recentDocs.length === 0 ? '<tr><td colspan="5" class="text-center py-2 text-muted">Nenhum documento emitido por esta instituição.</td></tr>' : recentDocs.map(d => `
+                  <tr>
+                    <td class="font-monospace fw-bold text-primary">${escapeHtml(d.verification_code)}</td>
+                    <td>${escapeHtml(d.holder_name)}</td>
+                    <td>${escapeHtml(d.document_type)} - ${escapeHtml(d.course || '')}</td>
+                    <td class="text-muted">${d.issue_date ? new Date(d.issue_date).toLocaleDateString('pt-PT') : '-'}</td>
+                    <td><span class="badge ${d.status === 'valid' ? 'bg-success' : 'bg-danger'}">${escapeHtml(d.status)}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    `;
+  }
+
+  /**
+   * 3. Consulta Global de Documentos (/admin/documents)
+   */
+  private attachAdminDocumentsEvents(): void {
+    const inputSearch = document.getElementById('inputSearchAdminDocs') as HTMLInputElement | null;
+    const selectStatus = document.getElementById('selectAdminDocStatus') as HTMLSelectElement | null;
+    const selectInst = document.getElementById('selectAdminDocInstitution') as HTMLSelectElement | null;
+    const btnRefresh = document.getElementById('btnRefreshAdminDocs');
+
+    // Popula dropdown de instituições
+    authService.getAdminInstitutions().then(res => {
+      if (res.success && res.institutions && selectInst) {
+        selectInst.innerHTML = '<option value="all">Todas as Instituições</option>' +
+          res.institutions.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+      }
+    });
+
+    const triggerReload = () => {
+      const search = inputSearch?.value.trim() || '';
+      const status = selectStatus?.value || 'all';
+      const instId = selectInst?.value || 'all';
+      this.loadAdminDocumentsList(search, status, instId);
+    };
+
+    if (inputSearch) inputSearch.addEventListener('input', triggerReload);
+    if (selectStatus) selectStatus.addEventListener('change', triggerReload);
+    if (selectInst) selectInst.addEventListener('change', triggerReload);
+    if (btnRefresh) btnRefresh.addEventListener('click', triggerReload);
+
+    this.loadAdminDocumentsList();
+  }
+
+  private async loadAdminDocumentsList(search?: string, status?: string, instId?: string): Promise<void> {
+    const tableBody = document.getElementById('adminDocsTableBody');
+    if (!tableBody) return;
+
+    tableBody.innerHTML = `
+      <tr>
+        <td colspan="8" class="text-center py-5 text-muted">
+          <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+          A carregar documentos...
+        </td>
+      </tr>
+    `;
+
+    const res = await authService.getAdminDocuments(search, status, instId);
+    if (!res.success || !res.documents) {
+      tableBody.innerHTML = `<tr><td colspan="8" class="text-center py-4 text-danger">Falha ao buscar documentos: ${res.error}</td></tr>`;
+      return;
+    }
+
+    const docs = res.documents;
+    if (docs.length === 0) {
+      tableBody.innerHTML = `<tr><td colspan="8" class="text-center py-5 text-muted">Nenhum documento encontrado.</td></tr>`;
+      return;
+    }
+
+    tableBody.innerHTML = docs.map(d => {
+      const isOk = d.status === 'valid';
+      const isRev = d.status === 'revoked';
+      const badgeClass = isOk ? 'bg-success' : isRev ? 'bg-danger' : 'bg-warning text-dark';
+      const dateStr = d.issue_date ? new Date(d.issue_date).toLocaleDateString('pt-PT') : '-';
+
+      return `
+        <tr>
+          <td>
+            <a href="/verificar/${d.verification_code}" data-route="/verificar/${d.verification_code}" class="font-monospace fw-bold text-primary text-decoration-none">
+              ${escapeHtml(d.verification_code)}
+            </a>
+          </td>
+          <td><strong class="text-dark">${escapeHtml(d.holder_name)}</strong></td>
+          <td>
+            <div>${escapeHtml(d.document_type)}</div>
+            <span class="text-muted small">${escapeHtml(d.course || '-')}</span>
+          </td>
+          <td><span class="text-dark small">${escapeHtml(d.institution_name || '-')}</span></td>
+          <td class="text-muted small">${dateStr}</td>
+          <td><span class="badge ${badgeClass} text-uppercase px-2.5 py-1">${escapeHtml(d.status)}</span></td>
+          <td><span class="badge bg-light text-dark border font-monospace">${(d as any).total_verifications || 0}</span></td>
+          <td class="text-end">
+            <a href="/verificar/${d.verification_code}" data-route="/verificar/${d.verification_code}" class="btn btn-outline-primary btn-sm py-0 px-2" style="font-size: 0.72rem;">
+              <i class="bi bi-patch-check me-1"></i> Validar
+            </a>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  /**
+   * 4. Consulta de Verificações Públicas (/admin/verifications)
+   */
+  private attachAdminVerificationsEvents(): void {
+    const inputSearch = document.getElementById('inputSearchVerifications') as HTMLInputElement | null;
+    const selectResult = document.getElementById('selectVerificationResult') as HTMLSelectElement | null;
+    const btnRefresh = document.getElementById('btnRefreshVerifications');
+
+    const triggerReload = () => {
+      const search = inputSearch?.value.trim() || '';
+      const result = selectResult?.value || 'all';
+      this.loadAdminVerificationsList(search, result);
+    };
+
+    if (inputSearch) inputSearch.addEventListener('input', triggerReload);
+    if (selectResult) selectResult.addEventListener('change', triggerReload);
+    if (btnRefresh) btnRefresh.addEventListener('click', triggerReload);
+
+    this.loadAdminVerificationsList();
+  }
+
+  private async loadAdminVerificationsList(search?: string, result?: string): Promise<void> {
+    const tableBody = document.getElementById('verificationsTableBody');
+    if (!tableBody) return;
+
+    tableBody.innerHTML = `
+      <tr>
+        <td colspan="7" class="text-center py-5 text-muted">
+          <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+          A carregar histórico de verificações...
+        </td>
+      </tr>
+    `;
+
+    const res = await authService.getAdminVerifications(search, result);
+    if (!res.success || !res.verifications) {
+      tableBody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-danger">Falha ao buscar verificações: ${res.error}</td></tr>`;
+      return;
+    }
+
+    const items = res.verifications;
+    if (items.length === 0) {
+      tableBody.innerHTML = `<tr><td colspan="7" class="text-center py-5 text-muted">Nenhum registro de verificação localizado.</td></tr>`;
+      return;
+    }
+
+    tableBody.innerHTML = items.map(v => {
+      const isOk = v.result === 'valid';
+      const isRev = v.result === 'revoked';
+      const isNotFound = v.result === 'not_found';
+      const isTampered = v.result === 'tampered';
+
+      const badgeClass = 
+        isOk ? 'bg-success' :
+        isRev ? 'bg-danger' :
+        isNotFound ? 'bg-secondary' :
+        isTampered ? 'bg-danger border border-white' : 'bg-warning text-dark';
+
+      const dateStr = v.verified_at ? new Date(v.verified_at).toLocaleString('pt-PT') : '-';
+
+      return `
+        <tr>
+          <td>
+            <span class="font-monospace fw-bold text-primary">${escapeHtml(v.verification_code)}</span>
+          </td>
+          <td><span class="badge ${badgeClass} text-uppercase px-2.5 py-1">${escapeHtml(v.result)}</span></td>
+          <td>
+            <div class="text-dark fw-semibold">${escapeHtml(v.holder_name || '(Não identificado)')}</div>
+            <span class="text-muted small">${escapeHtml(v.document_type || '')}</span>
+          </td>
+          <td><span class="text-muted small">${escapeHtml(v.institution_name || '-')}</span></td>
+          <td><span class="font-monospace small text-muted">${escapeHtml(v.ip_address || '-')}</span></td>
+          <td class="text-muted small">${dateStr}</td>
+          <td class="text-end">
+            <a href="/verificar/${v.verification_code}" data-route="/verificar/${v.verification_code}" class="btn btn-outline-secondary btn-sm py-0 px-2" style="font-size: 0.72rem;">
+              Ver na Web
+            </a>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  /**
+   * 5. Consulta de Logs de Auditoria (/admin/logs)
+   */
+  private attachAdminLogsEvents(): void {
+    const inputSearch = document.getElementById('inputSearchLogs') as HTMLInputElement | null;
+    const selectAction = document.getElementById('selectLogAction') as HTMLSelectElement | null;
+    const btnRefresh = document.getElementById('btnRefreshLogs');
+
+    const triggerReload = () => {
+      const search = inputSearch?.value.trim() || '';
+      const action = selectAction?.value || 'all';
+      this.loadAdminLogsList(action, search);
+    };
+
+    if (inputSearch) inputSearch.addEventListener('input', triggerReload);
+    if (selectAction) selectAction.addEventListener('change', triggerReload);
+    if (btnRefresh) btnRefresh.addEventListener('click', triggerReload);
+
+    this.loadAdminLogsList();
+  }
+
+  private async loadAdminLogsList(action?: string, search?: string): Promise<void> {
+    const tableBody = document.getElementById('logsTableBody');
+    if (!tableBody) return;
+
+    tableBody.innerHTML = `
+      <tr>
+        <td colspan="6" class="text-center py-5 text-muted">
+          <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+          A consultar trilha de auditoria...
+        </td>
+      </tr>
+    `;
+
+    const res = await authService.getAdminLogs(action, search);
+    if (!res.success || !res.logs) {
+      tableBody.innerHTML = `<tr><td colspan="6" class="text-center py-4 text-danger">Falha ao buscar logs: ${res.error}</td></tr>`;
+      return;
+    }
+
+    const logs = res.logs;
+    if (logs.length === 0) {
+      tableBody.innerHTML = `<tr><td colspan="6" class="text-center py-5 text-muted">Nenhum registro de log encontrado.</td></tr>`;
+      return;
+    }
+
+    tableBody.innerHTML = logs.map(l => {
+      const actionBadge = 
+        l.action.includes('login') ? 'bg-primary' :
+        l.action.includes('issued') ? 'bg-success' :
+        l.action.includes('revoked') ? 'bg-danger' :
+        l.action.includes('status') ? 'bg-warning text-dark' : 'bg-dark';
+
+      const dateStr = l.created_at ? new Date(l.created_at).toLocaleString('pt-PT') : '-';
+
+      return `
+        <tr>
+          <td class="font-monospace text-muted fw-bold">#${l.id}</td>
+          <td><span class="badge ${actionBadge} small font-monospace">${escapeHtml(l.action)}</span></td>
+          <td>
+            <div class="fw-semibold text-dark">${escapeHtml(l.user_name || 'Sistema')}</div>
+            <span class="text-muted small" style="font-size: 0.72rem;">${escapeHtml(l.user_email || '')}</span>
+          </td>
+          <td><span class="font-monospace small text-muted">${escapeHtml(l.ip_address || '-')}</span></td>
+          <td class="small text-secondary" style="max-width: 320px;">${escapeHtml(l.details)}</td>
+          <td class="text-muted small text-nowrap">${dateStr}</td>
+        </tr>
+      `;
+    }).join('');
+  }
 }
+

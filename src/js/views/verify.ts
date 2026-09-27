@@ -1,14 +1,20 @@
+import { escapeHtml } from '../utils/sanitize';
+
 /**
  * Página Pública de Verificação (/verificar e /verificar/{codigo})
- * Acesso livre sem exigir autenticação.
- * Exibe exatamente os 4 estados:
- * - DOCUMENTO VÁLIDO (com Titular, Tipo, Curso, Instituição, Data de emissão, Estado, Código)
+ * Acesso público sem login.
+ * Proteção total contra XSS (higienização de todas as variáveis).
+ * Exibe os estados:
+ * - DOCUMENTO VÁLIDO (com Integridade SHA-256 Confirmada)
  * - DOCUMENTO NÃO ENCONTRADO
  * - DOCUMENTO REVOGADO
  * - DOCUMENTO EXPIRADO
+ * - INTEGRIDADE COMPROMETIDA (se os dados sofrerem adulteração)
  */
 
 export function renderVerifyPage(initialCode?: string): string {
+  const safeInitialCode = escapeHtml(initialCode || '');
+
   return `
     <!-- Topo Institucional -->
     <div class="py-5" style="background: radial-gradient(circle at 50% 0%, #172E5A 0%, #0A1428 55%, #050B16 100%);">
@@ -56,7 +62,7 @@ export function renderVerifyPage(initialCode?: string): string {
                   id="verificationCodeInput" 
                   class="form-control font-monospace" 
                   placeholder="Ex: VD-2026-8F72K91X" 
-                  value="${initialCode || ''}"
+                  value="${safeInitialCode}"
                   autocomplete="off"
                 >
                 <button class="btn btn-vd-primary px-4" type="button" id="btnVerifyCode">
@@ -85,7 +91,7 @@ export function renderVerifyPage(initialCode?: string): string {
 
                 <h5 class="fw-bold text-dark mb-1">Acesso Direto via QR Code</h5>
                 <p class="text-secondary small mb-3 mx-auto" style="max-width: 480px;">
-                  O QR Code oficial gravado no documento aponta diretamente para a URL de verificação <code>/verificar/{codigo}</code>. Aponte a câmara do telemóvel para aceder de forma instantânea.
+                  O QR Code gravado no documento aponta diretamente para a URL de verificação <code>/verificar/{codigo}</code> sem embutir dados pessoais desnecessários.
                 </p>
 
                 <div class="d-flex justify-content-center gap-2">
@@ -115,16 +121,13 @@ export function renderVerifyPage(initialCode?: string): string {
 }
 
 /**
- * Helper para renderizar o resultado:
- * 1. DOCUMENTO VÁLIDO
- * 2. DOCUMENTO NÃO ENCONTRADO
- * 3. DOCUMENTO REVOGADO
- * 4. DOCUMENTO EXPIRADO
+ * Renderiza o resultado da verificação com total proteção anti-XSS
  */
 export function buildVerificationResultHtml(data: {
   found: boolean;
-  result: 'valid' | 'revoked' | 'expired' | 'not_found';
+  result: 'valid' | 'revoked' | 'expired' | 'tampered' | 'not_found';
   title: string;
+  integrity_verified?: boolean;
   message?: string;
   document?: {
     titular: string;
@@ -144,13 +147,12 @@ export function buildVerificationResultHtml(data: {
   };
   queryCode?: string;
 }): string {
-  const code = data.document?.codigo || data.queryCode || '-';
+  const code = escapeHtml(data.document?.codigo || data.queryCode || '-');
 
   // 1. ESTADO: DOCUMENTO NÃO ENCONTRADO
   if (!data.found || data.result === 'not_found' || !data.document) {
     return `
       <div class="border-top border-5 border-secondary bg-white p-4 p-md-5 text-center">
-        <!-- Badge e Título Requerido -->
         <div class="mb-3">
           <span class="badge bg-secondary text-white px-3 py-2 rounded-pill fw-bold text-uppercase fs-6">
             <i class="bi bi-question-circle-fill me-1"></i> Resultado da Consulta
@@ -182,7 +184,53 @@ export function buildVerificationResultHtml(data: {
     `;
   }
 
-  const doc = data.document;
+  // 2. ESTADO: INTEGRIDADE COMPROMETIDA (DADOS NÃO CONFEREM COM O HASH SHA-256)
+  if (data.result === 'tampered' || data.integrity_verified === false) {
+    return `
+      <div class="border-top border-5 border-danger bg-white p-4 p-md-5 text-center">
+        <div class="mb-3">
+          <span class="badge bg-danger text-white px-3 py-2 rounded-pill fw-bold text-uppercase fs-6">
+            <i class="bi bi-shield-x me-1"></i> FALHA DE INTEGRIDADE CRIPTOGRÁFICA
+          </span>
+        </div>
+
+        <h2 class="display-6 fw-bold text-danger mb-2">INTEGRIDADE COMPROMETIDA</h2>
+
+        <div class="alert alert-danger mx-auto text-start small mb-4 rounded-3 shadow-sm" style="max-width: 620px;">
+          <h5 class="fw-bold mb-1"><i class="bi bi-exclamation-triangle-fill me-1"></i> ALERTA CRÍTICO DE ADULTERAÇÃO</h5>
+          <div>
+            O hash criptográfico SHA-256 calculado a partir dos dados atuais <strong>não coincide</strong> com a assinatura digital original gravada na emissão. Os dados foram modificados de forma não autorizada na base de dados.
+          </div>
+        </div>
+
+        <div class="font-monospace text-muted small mb-4">Código afetado: <code>${code}</code></div>
+
+        <button type="button" class="btn btn-outline-secondary btn-sm px-4" id="btnResetVerify">
+          <i class="bi bi-arrow-repeat me-1"></i> Realizar Nova Consulta
+        </button>
+      </div>
+    `;
+  }
+
+  const rawDoc = data.document;
+  // Higienização completa contra XSS
+  const doc = {
+    titular: escapeHtml(rawDoc.titular),
+    tipo: escapeHtml(rawDoc.tipo),
+    curso: escapeHtml(rawDoc.curso),
+    instituicao: escapeHtml(rawDoc.instituicao),
+    data_emissao: rawDoc.data_emissao,
+    data_validade: rawDoc.data_validade,
+    estado: escapeHtml(rawDoc.estado),
+    codigo: escapeHtml(rawDoc.codigo),
+    hash: escapeHtml(rawDoc.hash || ''),
+    qr_code: rawDoc.qr_code,
+    area: escapeHtml(rawDoc.area || ''),
+    descricao: escapeHtml(rawDoc.descricao || ''),
+    cidade: escapeHtml(rawDoc.cidade || ''),
+    pais: escapeHtml(rawDoc.pais || ''),
+  };
+
   const isOk = data.result === 'valid';
   const isRevoked = data.result === 'revoked';
   const isExpired = data.result === 'expired';
@@ -191,7 +239,6 @@ export function buildVerificationResultHtml(data: {
   const titleClass = isOk ? 'text-success' : isRevoked ? 'text-danger' : 'text-warning';
   const badgeClass = isOk ? 'bg-success text-white' : isRevoked ? 'bg-danger text-white' : 'bg-warning text-dark';
 
-  // Formatadores de data
   const dateEmissaoStr = doc.data_emissao ? new Date(doc.data_emissao).toLocaleDateString('pt-PT') : '-';
   const dateValidadeStr = doc.data_validade ? new Date(doc.data_validade).toLocaleDateString('pt-PT') : 'Vitalício';
 
@@ -201,10 +248,15 @@ export function buildVerificationResultHtml(data: {
       <!-- Cabeçalho do Resultado -->
       <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3 pb-3 mb-4 border-bottom border-light-subtle">
         <div>
-          <span class="badge ${badgeClass} px-3 py-1.5 rounded-pill fw-bold text-uppercase small mb-2 d-inline-block">
-            <i class="bi ${isOk ? 'bi-patch-check-fill' : isRevoked ? 'bi-slash-circle-fill' : 'bi-clock-history'} me-1"></i>
-            Estado Oficial: ${doc.estado}
-          </span>
+          <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+            <span class="badge ${badgeClass} px-3 py-1.5 rounded-pill fw-bold text-uppercase small">
+              <i class="bi ${isOk ? 'bi-patch-check-fill' : isRevoked ? 'bi-slash-circle-fill' : 'bi-clock-history'} me-1"></i>
+              Estado Oficial: ${doc.estado}
+            </span>
+            <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 px-2.5 py-1 rounded-pill small">
+              <i class="bi bi-shield-check me-1"></i> SHA-256 Íntegro
+            </span>
+          </div>
           <h2 class="display-6 fw-bold ${titleClass} mb-0">
             ${isOk ? 'DOCUMENTO VÁLIDO' : isRevoked ? 'DOCUMENTO REVOGADO' : 'DOCUMENTO EXPIRADO'}
           </h2>
@@ -239,7 +291,7 @@ export function buildVerificationResultHtml(data: {
         </div>
       ` : ''}
 
-      <!-- OS 7 CAMPOS OBRIGATÓRIOS EXIBIDOS COM DESTAQUE -->
+      <!-- OS 7 CAMPOS OBRIGATÓRIOS EXIBIDOS COM DESTAQUE (PRIVACIDADE RESPEITADA) -->
       <div class="row g-4 align-items-center mb-4">
         <div class="col-md-8">
           
@@ -326,11 +378,12 @@ export function buildVerificationResultHtml(data: {
         </div>
       </div>
 
-      <!-- Hash Criptográfico e Auditoria -->
+      <!-- Hash Criptográfico Canônico e Auditoria de Integridade -->
       ${doc.hash ? `
         <div class="p-3 bg-dark text-secondary rounded-3 font-monospace small text-break mb-4" style="font-size: 0.72rem;">
-          <div class="text-white fw-bold mb-1">
-            <i class="bi bi-shield-lock-fill text-info me-1"></i> Assinatura Digital Inviolável (SHA-256):
+          <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 text-white fw-bold mb-1">
+            <span><i class="bi bi-shield-lock-fill text-info me-1"></i> Assinatura Digital SHA-256 Verificada:</span>
+            <span class="badge bg-success text-white" style="font-size: 0.68rem;">INTEGRIDADE 100% CONFIRMADA</span>
           </div>
           <span class="text-info">${doc.hash}</span>
         </div>

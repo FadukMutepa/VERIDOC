@@ -81,7 +81,7 @@ $migrations = [
             issue_date DATE NOT NULL,
             expiry_date DATE NULL,
             verification_code VARCHAR(30) NOT NULL UNIQUE,
-            hash CHAR(64) NOT NULL UNIQUE,
+            hash CHAR(64) NOT NULL,
             status ENUM('valid', 'revoked', 'expired') NOT NULL DEFAULT 'valid',
             created_at TIMESTAMP NULL,
             updated_at TIMESTAMP NULL,
@@ -100,7 +100,7 @@ $migrations = [
             id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
             document_id BIGINT UNSIGNED NULL,
             verification_code VARCHAR(50) NOT NULL,
-            result ENUM('valid', 'revoked', 'expired', 'not_found') NOT NULL,
+            result ENUM('valid', 'revoked', 'expired', 'not_found', 'tampered') NOT NULL,
             ip_address VARCHAR(45) NULL,
             user_agent TEXT NULL,
             verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -145,6 +145,14 @@ $migrations = [
             CONSTRAINT fk_audit_user FOREIGN KEY (user_id)
                 REFERENCES users(id) ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    ",
+
+    '2026_01_01_000007_add_details_to_documents_table' => "
+        ALTER TABLE documents 
+            ADD COLUMN IF NOT EXISTS area VARCHAR(150) NULL AFTER course,
+            ADD COLUMN IF NOT EXISTS description TEXT NULL AFTER expiry_date,
+            ADD COLUMN IF NOT EXISTS observations TEXT NULL AFTER description,
+            ADD COLUMN IF NOT EXISTS qr_code MEDIUMTEXT NULL AFTER hash;
     "
 ];
 

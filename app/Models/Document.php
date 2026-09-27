@@ -13,6 +13,7 @@ class Document extends Model
 
     protected $table = 'documents';
 
+    // Mass Assignment Protection: Apenas campos auditados permitidos
     protected $fillable = [
         'institution_id',
         'holder_name',
@@ -37,6 +38,45 @@ class Document extends Model
     ];
 
     /**
+     * Calcula o Hash SHA-256 canônico a partir dos dados essenciais do documento.
+     * Padrão: Nome + Tipo + Instituição + Curso + Data de Emissão -> SHA-256
+     */
+    public static function calculateCanonicalHash(
+        string $holderName,
+        string $documentType,
+        int|string $institutionId,
+        string $course,
+        string $issueDate
+    ): string {
+        $normDate = date('Y-m-d', strtotime($issueDate));
+        $canonicalPayload = implode('|', [
+            trim($holderName),
+            trim($documentType),
+            (string)$institutionId,
+            trim($course),
+            $normDate,
+        ]);
+
+        return hash('sha256', $canonicalPayload);
+    }
+
+    /**
+     * Valida a integridade criptográfica dos dados armazenados comparando com o hash do banco.
+     */
+    public function verifyIntegrity(): bool
+    {
+        $expectedHash = self::calculateCanonicalHash(
+            $this->holder_name,
+            $this->document_type,
+            $this->institution_id,
+            $this->course,
+            $this->issue_date->format('Y-m-d')
+        );
+
+        return hash_equals(strtolower($this->hash), strtolower($expectedHash));
+    }
+
+    /**
      * Relacionamento: Todo documento pertence a uma instituição emissora.
      */
     public function institution(): BelongsTo
@@ -45,8 +85,7 @@ class Document extends Model
     }
 
     /**
-     * Relacionamento: Um documento possui múltiplas consultas/verificações realizadas.
-     * Document → Verifications
+     * Relacionamento: Consultas realizadas no documento.
      */
     public function verifications(): HasMany
     {
@@ -54,8 +93,7 @@ class Document extends Model
     }
 
     /**
-     * Relacionamento: Um documento possui um histórico de ciclo de vida (emissão, edição, revogação).
-     * Document → History
+     * Relacionamento: Histórico de ciclo de vida.
      */
     public function histories(): HasMany
     {
@@ -75,6 +113,6 @@ class Document extends Model
             return false;
         }
 
-        return true;
+        return $this->verifyIntegrity();
     }
 }
