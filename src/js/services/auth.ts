@@ -160,7 +160,11 @@ class AuthService {
 
   public async login(email: string, password: string): Promise<{ success: boolean; message?: string; user?: AuthUser; error?: string; status?: string }> {
     try {
-      const res = await fetch('/api/auth/login', {
+      if (!this.csrfToken) {
+        await this.init();
+      }
+
+      let res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -170,7 +174,31 @@ class AuthService {
         credentials: 'include',
       });
 
-      const data = await res.json();
+      let data: any;
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        data = { error: 'O servidor retornou uma resposta inesperada.' };
+      }
+
+      // Se falhou por token CSRF ausente ou inválido, renova o token e repete a tentativa uma vez
+      if (res.status === 403 && (data.error?.includes('CSRF') || data.error?.includes('Token'))) {
+        await this.init();
+        res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-csrf-token': this.getCsrfToken(),
+          },
+          body: JSON.stringify({ email, password }),
+          credentials: 'include',
+        });
+        try {
+          data = await res.json();
+        } catch {
+          data = { error: 'Falha na autenticação após renovação da sessão.' };
+        }
+      }
 
       if (!res.ok) {
         return {
@@ -183,7 +211,8 @@ class AuthService {
       this.currentUser = data.user;
       return { success: true, user: data.user, message: data.message };
     } catch (e: any) {
-      return { success: false, error: 'Erro de conexão com o servidor.' };
+      console.error('Login error:', e);
+      return { success: false, error: e.message || 'Erro de conexão com o servidor.' };
     }
   }
 

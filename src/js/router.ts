@@ -881,7 +881,11 @@ export class VeriDocRouter {
           return;
         }
 
-        this.navigateTo('/instituicao/dashboard');
+        if (res.user?.role === 'admin') {
+          this.navigateTo('/admin/dashboard');
+        } else {
+          this.navigateTo('/instituicao/dashboard');
+        }
       });
     }
 

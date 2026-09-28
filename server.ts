@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
 import QRCode from 'qrcode';
+import { ensureDatabaseAndSeed } from './src/db/bootstrap';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -1747,8 +1748,17 @@ app.get('/api/public/verify/:code', verifyRateLimiter, async (req: Request, res:
 
 // Inicia servidor com Vite
 async function startServer() {
+  try {
+    await ensureDatabaseAndSeed();
+  } catch (err: any) {
+    console.error('[VeriDoc DB] Erro no bootstrap do banco:', err);
+  }
+
   const vite = await createViteServer({
-    server: { middlewareMode: true },
+    server: { 
+      middlewareMode: true,
+      allowedHosts: true,
+    },
     appType: 'spa',
   });
 
